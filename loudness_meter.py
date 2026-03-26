@@ -5,97 +5,121 @@ import pygame
 import sys
 import threading
 import collections
-import time
+import datetime
+from scipy.signal import lfilter
 
-# --- Config ---
-DEVICE = 2
+# ─── Config ───────────────────────────────────────────────────────────────────
+DEVICE      = 2
 SAMPLE_RATE = 48000
-CHANNELS = 2
-BLOCK_SIZE = 2400      # 50ms blocks
+CHANNELS    = 2
+BLOCK_SIZE  = 2400          # 50ms
 
-# EBU R128 windows
-MOMENTARY_WIN  = 0.4
-SHORTTERM_WIN  = 3.0
-
-# Display
-WIDTH, HEIGHT = 800, 480
-FPS = 20
-
-# LUFS thresholds
+MOMENTARY_WIN    = 0.4
+SHORTTERM_WIN    = 3.0
+TARGET_LUFS      = -23.0
 YELLOW_THRESHOLD = -17.0
 RED_THRESHOLD    = -14.0
-TARGET_LUFS      = -23.0
-TP_ALERT_THRESH  = -1.0   # -1 dBTP alert
+FPS              = 20
 
-# --- Audio buffers ---
+# ─── K-weighting filter coefficients for 48kHz (ITU-R BS.1770-4) ─────────────
+# Stage 1: High-shelf pre-filter
+_PRE_B = np.array([1.53512485958697, -2.69169618940638,  1.19839281085285])
+_PRE_A = np.array([1.0,              -1.69065929318241,  0.73248077421585])
+# Stage 2: RLB high-pass
+_RLB_B = np.array([1.0,  -2.0,              1.0             ])
+_RLB_A = np.array([1.0,  -1.99004745483398, 0.99007225036621])
+
+# ─── Audio state ──────────────────────────────────────────────────────────────
 buf_momentary = collections.deque(maxlen=int(SAMPLE_RATE * MOMENTARY_WIN))
 buf_shortterm = collections.deque(maxlen=int(SAMPLE_RATE * SHORTTERM_WIN))
-buf_integrated = []
-buf_lra_vals   = collections.deque(maxlen=3600)  # ~3min of S values @20Hz
 
-meter = pyln.Meter(SAMPLE_RATE)
+# H: store per-block K-weighted energy [E_L, E_R]; ~1 MB for full hour
+hour_block_energies = collections.deque(maxlen=72000)  # 1hr @ 50ms/block
 
-latest = {"M": -70.0, "S": -70.0, "I": -70.0, "TP": -70.0, "LRA": 0.0}
-tp_alert_until = 0.0
+# K-weighting filter states (shape (2,) per channel), persists across blocks
+_zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
+_zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
+
+meter_ms = pyln.Meter(SAMPLE_RATE)
+latest = {"M": -70.0, "S": -70.0, "H": -70.0}
 lock = threading.Lock()
 
+current_hour = datetime.datetime.now().hour
+reset_hour_flag = False
+
+
+# ─── Audio processing ─────────────────────────────────────────────────────────
 def lufs_safe(m, audio):
     try:
-        val = m.integrated_loudness(audio)
-        return val if np.isfinite(val) else -70.0
+        v = m.integrated_loudness(audio)
+        return v if np.isfinite(v) else -70.0
     except Exception:
         return -70.0
 
-def compute_lra(s_values, integrated_lufs):
-    if len(s_values) < 6:
-        return 0.0
-    arr = np.array(s_values)
-    gated = arr[arr > -70.0]
-    if integrated_lufs > -70.0:
-        gated = gated[gated > (integrated_lufs - 20.0)]
-    if len(gated) < 2:
-        return 0.0
-    low  = np.percentile(gated, 10)
-    high = np.percentile(gated, 95)
-    return max(0.0, high - low)
+
+def k_weight_and_energy(audio):
+    """Apply stateful K-weighting filter; return mean-square energy per channel."""
+    global _zi_pre, _zi_rlb
+    energies = []
+    for ch in range(CHANNELS):
+        sig = audio[:, ch]
+        sig, _zi_pre[ch] = lfilter(_PRE_B, _PRE_A, sig, zi=_zi_pre[ch])
+        sig, _zi_rlb[ch] = lfilter(_RLB_B, _RLB_A, sig, zi=_zi_rlb[ch])
+        energies.append(float(np.mean(sig ** 2)))
+    return energies
+
+
+def compute_h(block_energies):
+    """EBU R128 two-stage gated integrated loudness from block K-weighted energies."""
+    if len(block_energies) < 2:
+        return -70.0
+    arr   = np.array(block_energies)            # (N, 2)
+    power = np.maximum(np.sum(arr, axis=1), 1e-12)  # stereo: G_L = G_R = 1
+    lufs  = -0.691 + 10.0 * np.log10(power)
+
+    # Stage 1: absolute gate -70 LUFS
+    m1 = lufs > -70.0
+    if not np.any(m1):
+        return -70.0
+
+    # Stage 2: relative gate (ungated mean - 8 LU)
+    rel = -0.691 + 10.0 * np.log10(np.mean(power[m1])) - 8.0
+    m2  = lufs > rel
+    if not np.any(m2):
+        return -70.0
+
+    return -0.691 + 10.0 * np.log10(np.mean(power[m2]))
+
 
 def audio_callback(indata, frames, time_info, status):
-    global buf_integrated, tp_alert_until
+    global _zi_pre, _zi_rlb, reset_hour_flag
+
     audio = indata.copy()
+
+    if reset_hour_flag:
+        hour_block_energies.clear()
+        _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
+        _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
+        reset_hour_flag = False
+
     buf_momentary.extend(audio)
     buf_shortterm.extend(audio)
-    buf_integrated.append(audio)
+    hour_block_energies.append(k_weight_and_energy(audio))
 
     arr_m = np.array(list(buf_momentary))
     arr_s = np.array(list(buf_shortterm))
 
-    M = lufs_safe(meter, arr_m) if len(arr_m) >= int(SAMPLE_RATE * MOMENTARY_WIN) else -70.0
-    S = lufs_safe(meter, arr_s) if len(arr_s) >= int(SAMPLE_RATE * SHORTTERM_WIN) else -70.0
-
-    if len(buf_integrated) >= 10:
-        arr_i = np.concatenate(buf_integrated)
-        I = lufs_safe(meter, arr_i)
-    else:
-        I = -70.0
-
-    TP = 20 * np.log10(np.max(np.abs(audio)) + 1e-9)
-
-    if S > -70.0:
-        buf_lra_vals.append(S)
-
-    LRA = compute_lra(list(buf_lra_vals), I)
-
-    now = time.time()
-    if TP > TP_ALERT_THRESH:
-        tp_alert_until = now + 3.0
+    M = lufs_safe(meter_ms, arr_m) if len(arr_m) >= int(SAMPLE_RATE * MOMENTARY_WIN) else -70.0
+    S = lufs_safe(meter_ms, arr_s) if len(arr_s) >= int(SAMPLE_RATE * SHORTTERM_WIN) else -70.0
+    H = compute_h(list(hour_block_energies))
 
     with lock:
-        latest["M"]   = M
-        latest["S"]   = S
-        latest["I"]   = I
-        latest["TP"]  = TP
-        latest["LRA"] = LRA
+        latest["M"] = M
+        latest["S"] = S
+        latest["H"] = H
 
+
+# ─── GUI ──────────────────────────────────────────────────────────────────────
 def lufs_to_color(val):
     if val >= RED_THRESHOLD:
         return (220, 50, 50)
@@ -104,49 +128,78 @@ def lufs_to_color(val):
     else:
         return (50, 200, 80)
 
-def lra_to_color(val):
-    if val > 15.0:
-        return (220, 50, 50)
-    elif val > 10.0:
-        return (220, 200, 50)
-    else:
-        return (50, 200, 80)
 
-def draw_bar(surface, font, label, val, x, y, w, h,
-             lo=-60.0, hi=0.0, target_val=None, color_fn=None):
-    pygame.draw.rect(surface, (30, 30, 30), (x, y, w, h))
-    clamp = max(lo, min(hi, val))
-    fill_ratio = (clamp - lo) / (hi - lo)
-    fill_h = int(h * fill_ratio)
-    color = (color_fn(val) if color_fn else lufs_to_color(val))
-    pygame.draw.rect(surface, color, (x, y + h - fill_h, w, fill_h))
+def draw_panel(surface, fonts, title, val, px, pw, ph):
+    """Draw one vertical meter panel."""
+    font_title, font_letters, font_value = fonts
 
-    if target_val is not None:
-        ty = y + h - int(h * ((target_val - lo) / (hi - lo)))
-        pygame.draw.line(surface, (255, 255, 255), (x, ty), (x + w, ty), 1)
+    TITLE_H  = 38
+    LETTER_W = 42
+    PAD      = 6
+    LO, HI   = -60.0, 0.0
 
-    lbl_s = font.render(label, True, (200, 200, 200))
-    surface.blit(lbl_s, (x + w // 2 - lbl_s.get_width() // 2, y + h + 5))
+    BAR_Y = TITLE_H
+    BAR_X = px + LETTER_W + PAD
+    BAR_W = pw - LETTER_W - PAD * 2
+    BAR_H = ph - TITLE_H - PAD
 
-    if label == "LRA":
-        val_str = f"{val:.1f} LU" if val > 0 else "--"
-    else:
-        val_str = f"{val:.1f}" if val > -70 else "--"
-    val_surf = font.render(val_str, True, color)
-    surface.blit(val_surf, (x + w // 2 - val_surf.get_width() // 2, y - 22))
+    color = lufs_to_color(val)
+
+    # Title
+    t = font_title.render(title, True, (170, 170, 170))
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, 9))
+
+    # Bar background
+    pygame.draw.rect(surface, (28, 28, 28), (BAR_X, BAR_Y, BAR_W, BAR_H))
+
+    # Bar fill
+    fill_h = int(BAR_H * (max(LO, min(HI, val)) - LO) / (HI - LO))
+    pygame.draw.rect(surface, color, (BAR_X, BAR_Y + BAR_H - fill_h, BAR_W, fill_h))
+
+    # Target line at -23 LUFS
+    ty = BAR_Y + BAR_H - int(BAR_H * (TARGET_LUFS - LO) / (HI - LO))
+    pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
+
+    # "METER" letters stacked vertically on the left strip
+    step = BAR_H // 6
+    for i, ch in enumerate("METER"):
+        ls = font_letters.render(ch, True, (100, 100, 100))
+        lx = px + LETTER_W // 2 - ls.get_width() // 2
+        ly = BAR_Y + step * (i + 1) - ls.get_height() // 2
+        surface.blit(ls, (lx, ly))
+
+    # Big LUFS value, centered in bar area
+    val_str = f"{val:.1f}" if val > -70 else "---"
+    vs = font_value.render(val_str, True, color)
+    vx = BAR_X + BAR_W // 2 - vs.get_width() // 2
+    vy = BAR_Y + BAR_H // 2 - vs.get_height() // 2
+    # Semi-transparent dark background for readability
+    bg = pygame.Surface((vs.get_width() + 16, vs.get_height() + 10), pygame.SRCALPHA)
+    bg.fill((15, 15, 15, 185))
+    surface.blit(bg, (vx - 8, vy - 5))
+    surface.blit(vs, (vx, vy))
+
 
 def main():
+    global current_hour, reset_hour_flag
+
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("EBU R128 Loudness Meter")
-    font     = pygame.font.SysFont("monospace", 16)
-    font_big = pygame.font.SysFont("monospace", 20, bold=True)
-    clock    = pygame.time.Clock()
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    W, H = screen.get_size()
+    pygame.mouse.set_visible(False)
+    clock = pygame.time.Clock()
+
+    font_title   = pygame.font.SysFont("monospace", 20, bold=True)
+    font_letters = pygame.font.SysFont("monospace", 22, bold=True)
+    font_value   = pygame.font.SysFont("monospace", 56, bold=True)
+    fonts = (font_title, font_letters, font_value)
+
+    pw = W // 3
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE, device=DEVICE,
         channels=CHANNELS, dtype="float32",
-        blocksize=BLOCK_SIZE, callback=audio_callback
+        blocksize=BLOCK_SIZE, callback=audio_callback,
     )
 
     with stream:
@@ -157,45 +210,31 @@ def main():
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
 
+            # Hour reset check
+            now_h = datetime.datetime.now().hour
+            if now_h != current_hour:
+                current_hour = now_h
+                reset_hour_flag = True
+
             screen.fill((15, 15, 15))
 
             with lock:
                 vals = dict(latest)
 
-            bar_w = 90
-            gap   = 35
-            total = 5 * bar_w + 4 * gap
-            sx    = (WIDTH - total) // 2
-            bar_h = 300
-            bar_y = 80
+            for idx, (title, key) in enumerate([
+                ("MOMENTARY",  "M"),
+                ("SHORT TERM", "S"),
+                ("THIS HOUR",  "H"),
+            ]):
+                draw_panel(screen, fonts, title, vals[key], idx * pw, pw, H)
 
-            bars = [
-                ("M",   vals["M"],   -60.0, 0.0,  TARGET_LUFS, lufs_to_color),
-                ("S",   vals["S"],   -60.0, 0.0,  TARGET_LUFS, lufs_to_color),
-                ("I",   vals["I"],   -60.0, 0.0,  TARGET_LUFS, lufs_to_color),
-                ("TP",  vals["TP"],  -60.0, 0.0,  -1.0,        lufs_to_color),
-                ("LRA", vals["LRA"],  0.0,  20.0, None,        lra_to_color),
-            ]
-            for i, (lbl, val, lo, hi, tgt, cfn) in enumerate(bars):
-                bx = sx + i * (bar_w + gap)
-                draw_bar(screen, font, lbl, val, bx, bar_y, bar_w, bar_h,
-                         lo=lo, hi=hi, target_val=tgt, color_fn=cfn)
-
-            title = font_big.render("EBU R128 Loudness Meter", True, (180, 180, 180))
-            screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 15))
-
-            tgt_lbl = font.render("Target: -23 LUFS  |  TP limit: -1 dBTP", True, (130, 130, 130))
-            screen.blit(tgt_lbl, (WIDTH // 2 - tgt_lbl.get_width() // 2, HEIGHT - 22))
-
-            if time.time() < tp_alert_until:
-                alert_surf = pygame.Surface((WIDTH, 28), pygame.SRCALPHA)
-                alert_surf.fill((200, 30, 30, 210))
-                screen.blit(alert_surf, (0, 46))
-                alert_text = font.render("! TRUE PEAK OVER  -1 dBTP !", True, (255, 255, 255))
-                screen.blit(alert_text, (WIDTH // 2 - alert_text.get_width() // 2, 53))
+            # Panel dividers
+            for i in (1, 2):
+                pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
 
             pygame.display.flip()
             clock.tick(FPS)
+
 
 if __name__ == "__main__":
     main()
