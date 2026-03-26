@@ -129,25 +129,28 @@ def lufs_to_color(val):
         return (50, 200, 80)
 
 
+_SCALE_MARKS = [0, -10, -20, -23, -30, -40, -50, -60]
+
+
 def draw_panel(surface, fonts, title, val, px, pw, ph):
     """Draw one vertical meter panel."""
-    font_title, font_letters, font_value = fonts
+    font_title, font_scale, font_value = fonts
 
-    TITLE_H  = 38
-    LETTER_W = 42
+    TITLE_H  = 46
+    SCALE_W  = 50          # left strip for dB scale
     PAD      = 6
     LO, HI   = -60.0, 0.0
 
     BAR_Y = TITLE_H
-    BAR_X = px + LETTER_W + PAD
-    BAR_W = pw - LETTER_W - PAD * 2
+    BAR_X = px + SCALE_W + PAD
+    BAR_W = pw - SCALE_W - PAD * 2
     BAR_H = ph - TITLE_H - PAD
 
     color = lufs_to_color(val)
 
     # Title
     t = font_title.render(title, True, (170, 170, 170))
-    surface.blit(t, (px + pw // 2 - t.get_width() // 2, 9))
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, 8))
 
     # Bar background
     pygame.draw.rect(surface, (28, 28, 28), (BAR_X, BAR_Y, BAR_W, BAR_H))
@@ -156,24 +159,31 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     fill_h = int(BAR_H * (max(LO, min(HI, val)) - LO) / (HI - LO))
     pygame.draw.rect(surface, color, (BAR_X, BAR_Y + BAR_H - fill_h, BAR_W, fill_h))
 
-    # Target line at -23 LUFS
+    # dB scale on left strip
+    for db in _SCALE_MARKS:
+        ratio = (db - LO) / (HI - LO)
+        y = BAR_Y + BAR_H - int(BAR_H * ratio)
+        is_target = (db == -23)
+        tick_color = (255, 255, 255) if is_target else (110, 110, 110)
+        tick_len   = 10 if is_target else 6
+        # tick line into bar
+        pygame.draw.line(surface, tick_color,
+                         (BAR_X - tick_len, y), (BAR_X, y), 1)
+        # label, right-aligned against the tick
+        label = str(db)
+        ls = font_scale.render(label, True, tick_color)
+        surface.blit(ls, (BAR_X - tick_len - ls.get_width() - 3,
+                          y - ls.get_height() // 2))
+
+    # Target line across bar
     ty = BAR_Y + BAR_H - int(BAR_H * (TARGET_LUFS - LO) / (HI - LO))
     pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
-
-    # "METER" letters stacked vertically on the left strip
-    step = BAR_H // 6
-    for i, ch in enumerate("METER"):
-        ls = font_letters.render(ch, True, (100, 100, 100))
-        lx = px + LETTER_W // 2 - ls.get_width() // 2
-        ly = BAR_Y + step * (i + 1) - ls.get_height() // 2
-        surface.blit(ls, (lx, ly))
 
     # Big LUFS value, centered in bar area
     val_str = f"{val:.1f}" if val > -70 else "---"
     vs = font_value.render(val_str, True, color)
     vx = BAR_X + BAR_W // 2 - vs.get_width() // 2
     vy = BAR_Y + BAR_H // 2 - vs.get_height() // 2
-    # Semi-transparent dark background for readability
     bg = pygame.Surface((vs.get_width() + 16, vs.get_height() + 10), pygame.SRCALPHA)
     bg.fill((15, 15, 15, 185))
     surface.blit(bg, (vx - 8, vy - 5))
@@ -189,10 +199,10 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    font_title   = pygame.font.SysFont("monospace", 20, bold=True)
-    font_letters = pygame.font.SysFont("monospace", 22, bold=True)
-    font_value   = pygame.font.SysFont("monospace", 56, bold=True)
-    fonts = (font_title, font_letters, font_value)
+    font_title = pygame.font.SysFont("monospace", 26, bold=True)
+    font_scale = pygame.font.SysFont("monospace", 12)
+    font_value = pygame.font.SysFont("monospace", 66, bold=True)
+    fonts = (font_title, font_scale, font_value)
 
     pw = W // 3
 
