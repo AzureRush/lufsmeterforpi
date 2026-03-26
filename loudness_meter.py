@@ -136,8 +136,8 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     """Draw one vertical meter panel."""
     font_title, font_scale, font_value = fonts
 
-    TITLE_H  = 46
-    SCALE_W  = 50          # left strip for dB scale
+    TITLE_H  = 58
+    SCALE_W  = 80          # left strip for dB scale (32pt labels need ~75px)
     PAD      = 6
     LO, HI   = -60.0, 0.0
 
@@ -199,9 +199,9 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    font_title = pygame.font.SysFont("monospace", 26, bold=True)
-    font_scale = pygame.font.SysFont("monospace", 12)
-    font_value = pygame.font.SysFont("monospace", 66, bold=True)
+    font_title = pygame.font.SysFont("monospace", 42, bold=True)
+    font_scale = pygame.font.SysFont("monospace", 32)
+    font_value = pygame.font.SysFont("monospace", 100, bold=True)
     fonts = (font_title, font_scale, font_value)
 
     pw = W // 3
