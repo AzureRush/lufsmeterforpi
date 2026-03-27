@@ -152,10 +152,11 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     """Draw one vertical meter panel."""
     font_title, font_scale, font_value = fonts
 
-    TITLE_H = 115       # accommodates 100pt title
-    SCALE_W = 80
-    PAD     = 6
-    LO, HI  = -60.0, 0.0
+    TITLE_H   = 85        # accommodates 70pt title
+    SCALE_W   = 80
+    PAD       = 6
+    MARGIN    = 10        # horizontal margin for value text inside panel
+    LO, HI    = -60.0, 0.0
 
     BAR_Y = TITLE_H
     BAR_X = px + SCALE_W + PAD
@@ -193,14 +194,19 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     ty = BAR_Y + BAR_H - int(BAR_H * _y_ratio(TARGET_LUFS, LO, HI))
     pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
 
-    # Big LUFS value — no decimal (integer) to fit 150pt within panel width
+    # Big LUFS value — auto-scale to fill panel width with small margin
     val_str = f"{int(round(val))}" if val > -70 else "---"
-    vs = font_value.render(val_str, True, color)
-    vx = px + pw // 2 - vs.get_width() // 2
-    vy = BAR_Y + BAR_H // 2 - vs.get_height() // 2
-    bg = pygame.Surface((vs.get_width() + 16, vs.get_height() + 10), pygame.SRCALPHA)
+    vs_raw = font_value.render(val_str, True, color)
+    max_w = pw - MARGIN * 2
+    max_h = BAR_H - MARGIN * 2
+    scale  = min(max_w / vs_raw.get_width(), max_h / vs_raw.get_height())
+    new_w  = int(vs_raw.get_width()  * scale)
+    new_h  = int(vs_raw.get_height() * scale)
+    vs     = pygame.transform.smoothscale(vs_raw, (new_w, new_h))
+    vx = px + pw // 2 - new_w // 2
+    vy = BAR_Y + BAR_H // 2 - new_h // 2
+    bg = pygame.Surface((new_w + 16, new_h + 10), pygame.SRCALPHA)
     bg.fill((15, 15, 15, 185))
-    # Clip value to panel so it doesn't bleed into neighbours
     surface.set_clip(pygame.Rect(px, BAR_Y, pw, BAR_H))
     surface.blit(bg, (vx - 8, vy - 5))
     surface.blit(vs, (vx, vy))
@@ -216,9 +222,9 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    font_title = pygame.font.SysFont("monospace", 100, bold=True)
+    font_title = pygame.font.SysFont("monospace", 70, bold=True)
     font_scale = pygame.font.SysFont("monospace", 32)
-    font_value = pygame.font.SysFont("monospace", 150, bold=True)
+    font_value = pygame.font.SysFont("monospace", 250, bold=True)  # scaled down at render time
     fonts = (font_title, font_scale, font_value)
 
     pw = W // 3
@@ -247,15 +253,11 @@ def main():
 
             with lock:
                 vals = dict(latest)
-                h_display = prev_hour_h  # previous hour's final value (None if not yet)
-
-            hour_title = f"THIS HOUR ({current_hour})"
-            h_val = h_display if h_display is not None else -70.0
 
             for idx, (title, val) in enumerate([
-                ("MOMENTARY",        vals["M"]),
-                ("SHORT TERM (3s)",  vals["S"]),
-                (hour_title,         h_val),
+                ("MOMENTARY",                   vals["M"]),
+                ("SHORT TERM (3s)",             vals["S"]),
+                (f"THIS HOUR ({current_hour})", vals["H"]),
             ]):
                 draw_panel(screen, fonts, title, val, idx * pw, pw, H)
 
