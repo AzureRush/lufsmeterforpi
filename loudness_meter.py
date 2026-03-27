@@ -46,6 +46,7 @@ lock = threading.Lock()
 
 current_hour = datetime.datetime.now().hour
 reset_hour_flag = False
+prev_hour_h    = None   # None until first hour boundary is crossed
 
 
 # ─── Audio processing ─────────────────────────────────────────────────────────
@@ -92,11 +93,14 @@ def compute_h(block_energies):
 
 
 def audio_callback(indata, frames, time_info, status):
-    global _zi_pre, _zi_rlb, reset_hour_flag
+    global _zi_pre, _zi_rlb, reset_hour_flag, prev_hour_h
 
     audio = indata.copy()
 
     if reset_hour_flag:
+        # Save last accumulated value before clearing
+        with lock:
+            prev_hour_h = latest["H"]
         hour_block_energies.clear()
         _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
         _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
@@ -130,16 +134,28 @@ def lufs_to_color(val):
 
 
 _SCALE_MARKS = [0, -10, -20, -23, -30, -40, -50, -60]
+# Non-linear split: -60..-40 compressed into bottom 20%, -40..0 expanded into top 80%
+_SPLIT_DB    = -40.0
+_SPLIT_FRAC  =  0.20
+
+
+def _y_ratio(val, lo=-60.0, hi=0.0):
+    """Map LUFS value to 0..1 bar fill ratio (bottom=0, top=1), non-linear."""
+    val = max(lo, min(hi, val))
+    if val <= _SPLIT_DB:
+        return _SPLIT_FRAC * (val - lo) / (_SPLIT_DB - lo)
+    else:
+        return _SPLIT_FRAC + (1.0 - _SPLIT_FRAC) * (val - _SPLIT_DB) / (hi - _SPLIT_DB)
 
 
 def draw_panel(surface, fonts, title, val, px, pw, ph):
     """Draw one vertical meter panel."""
     font_title, font_scale, font_value = fonts
 
-    TITLE_H  = 58
-    SCALE_W  = 80          # left strip for dB scale (32pt labels need ~75px)
-    PAD      = 6
-    LO, HI   = -60.0, 0.0
+    TITLE_H = 115       # accommodates 100pt title
+    SCALE_W = 80
+    PAD     = 6
+    LO, HI  = -60.0, 0.0
 
     BAR_Y = TITLE_H
     BAR_X = px + SCALE_W + PAD
@@ -148,50 +164,51 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
 
     color = lufs_to_color(val)
 
-    # Title
+    # Title (clipped to panel)
+    surface.set_clip(pygame.Rect(px, 0, pw, TITLE_H))
     t = font_title.render(title, True, (170, 170, 170))
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, 8))
+    surface.set_clip(None)
 
     # Bar background
     pygame.draw.rect(surface, (28, 28, 28), (BAR_X, BAR_Y, BAR_W, BAR_H))
 
-    # Bar fill
-    fill_h = int(BAR_H * (max(LO, min(HI, val)) - LO) / (HI - LO))
+    # Bar fill (non-linear)
+    fill_h = int(BAR_H * _y_ratio(val, LO, HI))
     pygame.draw.rect(surface, color, (BAR_X, BAR_Y + BAR_H - fill_h, BAR_W, fill_h))
 
-    # dB scale on left strip
+    # dB scale on left strip (non-linear positions)
     for db in _SCALE_MARKS:
-        ratio = (db - LO) / (HI - LO)
-        y = BAR_Y + BAR_H - int(BAR_H * ratio)
+        y = BAR_Y + BAR_H - int(BAR_H * _y_ratio(db, LO, HI))
         is_target = (db == -23)
         tick_color = (255, 255, 255) if is_target else (110, 110, 110)
         tick_len   = 10 if is_target else 6
-        # tick line into bar
         pygame.draw.line(surface, tick_color,
                          (BAR_X - tick_len, y), (BAR_X, y), 1)
-        # label, right-aligned against the tick
-        label = str(db)
-        ls = font_scale.render(label, True, tick_color)
+        ls = font_scale.render(str(db), True, tick_color)
         surface.blit(ls, (BAR_X - tick_len - ls.get_width() - 3,
                           y - ls.get_height() // 2))
 
-    # Target line across bar
-    ty = BAR_Y + BAR_H - int(BAR_H * (TARGET_LUFS - LO) / (HI - LO))
+    # Target line across bar (non-linear)
+    ty = BAR_Y + BAR_H - int(BAR_H * _y_ratio(TARGET_LUFS, LO, HI))
     pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
 
-    # Big LUFS value, centered in bar area
-    val_str = f"{val:.1f}" if val > -70 else "---"
+    # Big LUFS value — no decimal (integer) to fit 150pt within panel width
+    val_str = f"{int(round(val))}" if val > -70 else "---"
     vs = font_value.render(val_str, True, color)
-    vx = BAR_X + BAR_W // 2 - vs.get_width() // 2
+    vx = px + pw // 2 - vs.get_width() // 2
     vy = BAR_Y + BAR_H // 2 - vs.get_height() // 2
     bg = pygame.Surface((vs.get_width() + 16, vs.get_height() + 10), pygame.SRCALPHA)
     bg.fill((15, 15, 15, 185))
+    # Clip value to panel so it doesn't bleed into neighbours
+    surface.set_clip(pygame.Rect(px, BAR_Y, pw, BAR_H))
     surface.blit(bg, (vx - 8, vy - 5))
     surface.blit(vs, (vx, vy))
+    surface.set_clip(None)
 
 
 def main():
-    global current_hour, reset_hour_flag
+    global current_hour, reset_hour_flag, prev_hour_h
 
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -199,9 +216,9 @@ def main():
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
 
-    font_title = pygame.font.SysFont("monospace", 42, bold=True)
+    font_title = pygame.font.SysFont("monospace", 100, bold=True)
     font_scale = pygame.font.SysFont("monospace", 32)
-    font_value = pygame.font.SysFont("monospace", 100, bold=True)
+    font_value = pygame.font.SysFont("monospace", 150, bold=True)
     fonts = (font_title, font_scale, font_value)
 
     pw = W // 3
@@ -230,13 +247,17 @@ def main():
 
             with lock:
                 vals = dict(latest)
+                h_display = prev_hour_h  # previous hour's final value (None if not yet)
 
-            for idx, (title, key) in enumerate([
-                ("MOMENTARY",  "M"),
-                ("SHORT TERM", "S"),
-                ("THIS HOUR",  "H"),
+            hour_title = f"THIS HOUR ({current_hour})"
+            h_val = h_display if h_display is not None else -70.0
+
+            for idx, (title, val) in enumerate([
+                ("MOMENTARY",        vals["M"]),
+                ("SHORT TERM (3s)",  vals["S"]),
+                (hour_title,         h_val),
             ]):
-                draw_panel(screen, fonts, title, vals[key], idx * pw, pw, H)
+                draw_panel(screen, fonts, title, val, idx * pw, pw, H)
 
             # Panel dividers
             for i in (1, 2):
