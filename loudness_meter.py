@@ -194,9 +194,9 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     ty = BAR_Y + BAR_H - int(BAR_H * _y_ratio(TARGET_LUFS, LO, HI))
     pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
 
-    # Big LUFS value — auto-scale to fill panel width with small margin
+    # Big LUFS value — white text, auto-scale to fill panel width with small margin
     val_str = f"{int(round(val))}" if val > -70 else "---"
-    vs_raw = font_value.render(val_str, True, color)
+    vs_raw = font_value.render(val_str, True, (255, 255, 255))
     max_w = pw - MARGIN * 2
     max_h = BAR_H - MARGIN * 2
     scale  = min(max_w / vs_raw.get_width(), max_h / vs_raw.get_height())
@@ -205,10 +205,7 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
     vs     = pygame.transform.smoothscale(vs_raw, (new_w, new_h))
     vx = px + pw // 2 - new_w // 2
     vy = BAR_Y + BAR_H // 2 - new_h // 2
-    bg = pygame.Surface((new_w + 16, new_h + 10), pygame.SRCALPHA)
-    bg.fill((15, 15, 15, 185))
     surface.set_clip(pygame.Rect(px, BAR_Y, pw, BAR_H))
-    surface.blit(bg, (vx - 8, vy - 5))
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
 
