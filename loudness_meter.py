@@ -46,7 +46,6 @@ lock = threading.Lock()
 
 current_hour = datetime.datetime.now().hour
 reset_hour_flag = False
-prev_hour_h    = None   # None until first hour boundary is crossed
 
 
 # ─── Audio processing ─────────────────────────────────────────────────────────
@@ -93,14 +92,11 @@ def compute_h(block_energies):
 
 
 def audio_callback(indata, frames, time_info, status):
-    global _zi_pre, _zi_rlb, reset_hour_flag, prev_hour_h
+    global _zi_pre, _zi_rlb, reset_hour_flag
 
     audio = indata.copy()
 
     if reset_hour_flag:
-        # Save last accumulated value before clearing
-        with lock:
-            prev_hour_h = latest["H"]
         hour_block_energies.clear()
         _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
         _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
@@ -211,7 +207,7 @@ def draw_panel(surface, fonts, title, val, px, pw, ph):
 
 
 def main():
-    global current_hour, reset_hour_flag, prev_hour_h
+    global current_hour, reset_hour_flag
 
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -250,14 +246,11 @@ def main():
 
             with lock:
                 vals = dict(latest)
-                # Show previous hour's final frozen value;
-                # fall back to current accumulation until first hour boundary
-                h_val = prev_hour_h if prev_hour_h is not None else vals["H"]
 
             for idx, (title, val) in enumerate([
                 ("MOMENTARY",                   vals["M"]),
                 ("SHORT TERM (3s)",             vals["S"]),
-                (f"THIS HOUR ({current_hour})", h_val),
+                (f"THIS HOUR ({current_hour})", vals["H"]),
             ]):
                 draw_panel(screen, fonts, title, val, idx * pw, pw, H)
 
