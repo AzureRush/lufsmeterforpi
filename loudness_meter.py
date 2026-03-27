@@ -253,11 +253,14 @@ def main():
 
             with lock:
                 vals = dict(latest)
+                # Show previous hour's final frozen value;
+                # fall back to current accumulation until first hour boundary
+                h_val = prev_hour_h if prev_hour_h is not None else vals["H"]
 
             for idx, (title, val) in enumerate([
                 ("MOMENTARY",                   vals["M"]),
                 ("SHORT TERM (3s)",             vals["S"]),
-                (f"THIS HOUR ({current_hour})", vals["H"]),
+                (f"THIS HOUR ({current_hour})", h_val),
             ]):
                 draw_panel(screen, fonts, title, val, idx * pw, pw, H)
 
