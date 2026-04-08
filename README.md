@@ -23,13 +23,8 @@
 pip3 install sounddevice pyloudnorm pygame scipy numpy
 ```
 
-確認 Scarlett 2i2 被辨識：
-
-```bash
-python3 -c "import sounddevice as sd; print(sd.query_devices())"
-```
-
-確認 device index 對應到 Scarlett（預設為 `DEVICE = 2`），若不同請修改 `loudness_meter.py` 頂部的設定。
+程式啟動時會自動偵測 Focusrite Scarlett，無需手動設定 device index。
+若 Scarlett 未接上，程式會印出錯誤訊息並退出。
 
 ---
 
@@ -147,11 +142,12 @@ pygame main thread（20fps）
 `loudness_meter.py` 頂部可調整：
 
 ```python
-DEVICE      = 2       # sounddevice 裝置 index
 SAMPLE_RATE = 48000
 BLOCK_SIZE  = 2400    # 50ms per block
 TARGET_LUFS = -23.0   # 目標線位置
 ```
+
+Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
 ---
 

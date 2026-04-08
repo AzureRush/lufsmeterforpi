@@ -3,6 +3,7 @@ import sounddevice as sd
 import pyloudnorm as pyln
 import pygame
 import sys
+import subprocess
 import threading
 import collections
 import datetime
@@ -13,9 +14,52 @@ from scipy.signal import lfilter
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loudness_log.csv")
-DEVICE      = 2
 SAMPLE_RATE = 48000
 CHANNELS    = 2
+
+def _setup_scarlett():
+    """
+    Auto-detect Scarlett in PipeWire, set as default source, wake it if suspended.
+    Returns sounddevice 'default' device index.
+    """
+    # 1. Find Scarlett input source (exclude .monitor loopback)
+    r = subprocess.run(['pactl', 'list', 'sources', 'short'], capture_output=True, text=True)
+    scarlett_source = None
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        name = parts[1] if len(parts) > 1 else ''
+        if ('focusrite' in name.lower() or 'scarlett' in name.lower()) and not name.endswith('.monitor'):
+            scarlett_source = name
+            break
+
+    if not scarlett_source:
+        print("ERROR: Focusrite Scarlett not found. Connect the device and retry.")
+        sys.exit(1)
+
+    # 2. Set as PipeWire default source
+    subprocess.run(['pactl', 'set-default-source', scarlett_source])
+
+    # 3. Wake source with parecord — keeps it RUNNING long enough for sounddevice to connect
+    wake = subprocess.Popen(['parecord', '--device', scarlett_source, '/dev/null'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
+
+    # 4. Open a test stream to take over from parecord, then let parecord go
+    default_idx = next(
+        (i for i, d in enumerate(sd.query_devices())
+         if d['name'] == 'default' and d['max_input_channels'] > 0),
+        None
+    )
+    if default_idx is None:
+        wake.kill(); wake.wait()
+        print("ERROR: No 'default' audio device found in sounddevice.")
+        sys.exit(1)
+
+    wake.kill()
+    wake.wait()
+
+    print(f"Scarlett detected: {scarlett_source} → sounddevice [{default_idx}]")
+    return default_idx
 BLOCK_SIZE  = 2400          # 50ms per block
 
 MOMENTARY_WIN    = 0.4      # 400ms = 8 blocks
@@ -309,6 +353,8 @@ def draw_number_only_panel(surface, fonts, title, val, px, pw, py, ph):
 
 def main():
     global current_hour, reset_hour_flag, _running
+
+    DEVICE = _setup_scarlett()
 
     # Start compute thread before opening audio stream
     ct = threading.Thread(target=compute_loop, daemon=True)
