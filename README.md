@@ -49,16 +49,25 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 ### MOMENTARY（瞬時）
 - 400ms 滑動窗口，即時反應當下音量
+- meter bar 顯示當前電平
 - 底部顯示 **L / R 個別聲道電平**，方便監看立體聲平衡
 
 ### SHORT TERM 3s（短期）
 - 3 秒滑動窗口，反應近期平均音量
+- meter bar 顯示當前電平
 
-### THIS HOUR（本小時）
+### THIS HOUR / SEGMENT（第三面板，僅顯示數字）
+
+**THIS HOUR（上半）**
 - EBU R128 兩段 gating 積分響度，整點自動歸零
-- 適合監看長時間節目的整體響度趨勢
+- 靜音不影響數值（符合 EBU R128 規範，absolute gate 排除靜音）
 
-### 顏色規則
+**SEGMENT 3'（下半）**
+- 3 分鐘滑動窗口的 gating 積分響度
+- 設計用途：新聞播出時近似監看單則新聞帶響度（live read + VT 約 2'~3'）
+- 無須手動標記段落頭尾，滑動窗口隨時反映最近 3 分鐘的整體響度
+
+### 顏色規則（MOMENTARY / SHORT TERM）
 
 | 顏色 | 範圍 |
 |------|------|
@@ -67,6 +76,35 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 | 紅色 | > −14 LUFS |
 
 白色橫線標示 **−23 LUFS** 目標值（EBU R128 廣播標準）。
+
+---
+
+## 每小時紀錄
+
+程式會自動將每小時的 THIS HOUR 結果寫入：
+
+```
+~/loudness_meter/loudness_log.csv
+```
+
+格式：
+
+```csv
+date,hour,lufs
+2026-04-08,14,-23.1
+2026-04-08,15,-22.8
+2026-04-08,16,---
+```
+
+- 整點觸發，寫入剛結束那個小時的最終積分響度
+- ESC 退出時也會寫入目前這個小時（未完成）的數值
+- `---` 代表該小時幾乎全為靜音（未通過 gating）
+
+查看紀錄：
+
+```bash
+cat ~/loudness_meter/loudness_log.csv
+```
 
 ---
 
@@ -79,7 +117,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
   → K-weighting + 寫入 deque（每 50ms，CPU 占用 < 1%）
 
 compute_loop（daemon thread，10Hz）
-  → 讀取 snapshot → pyloudnorm 計算 M/S → 自製 gating 計算 H
+  → 讀取 snapshot → pyloudnorm 計算 M/S → 自製 gating 計算 H 和 SEG
 
 pygame main thread（20fps）
   → 讀取 latest dict → 渲染畫面
@@ -87,9 +125,13 @@ pygame main thread（20fps）
 
 ### 計算方法
 
-- **M / S**：使用 `pyloudnorm` 對立體聲音訊執行 `integrated_loudness()`
-- **H**：自製 EBU R128 兩段 gating——每個 50ms block 的 K-weighted 能量 `[E_L, E_R]` 存入 deque，整點清空重算
-- **L / R 聲道電平**：從 400ms 窗口對各聲道獨立做 K-weighting（非 stateful），轉換為 dB 顯示，供平衡監看用（非嚴格 EBU R128 定義）
+| 指標 | 方法 | 窗口 |
+|------|------|------|
+| M | pyloudnorm `integrated_loudness()` | 400ms 滑動 |
+| S | pyloudnorm `integrated_loudness()` | 3s 滑動 |
+| H | 自製 EBU R128 two-stage gating | 整點起累積 |
+| SEG | 同 H | 3 分鐘滑動 |
+| L/R | K-weighted mean-square per channel | 400ms 滑動 |
 
 ### 音量刻度（非線性）
 
@@ -118,4 +160,5 @@ TARGET_LUFS = -23.0   # 目標線位置
 - `compute_loop` 實際更新率約 4Hz（pyloudnorm 計算耗時），M 的 400ms 窗口在此速率下仍可接受
 - 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
 - M/S 對短窗口使用 `integrated_loudness()` 是近似，非嚴格 R128 Momentary/Short-term 定義
+- SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
 - True Peak 未實作（前端硬體設備已具備 peak 偵測功能）

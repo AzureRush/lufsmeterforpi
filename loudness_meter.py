@@ -7,9 +7,12 @@ import threading
 import collections
 import datetime
 import time
+import csv
+import os
 from scipy.signal import lfilter
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loudness_log.csv")
 DEVICE      = 2
 SAMPLE_RATE = 48000
 CHANNELS    = 2
@@ -36,14 +39,15 @@ _RLB_A = np.array([1.0,  -1.99004745483398, 0.99007225036621])
 # Audio callback only appends; compute thread only reads snapshots.
 buf_m_chunks = collections.deque(maxlen=M_BLOCKS)   # ~400ms
 buf_s_chunks = collections.deque(maxlen=S_BLOCKS)   # ~3s
-hour_block_energies = collections.deque(maxlen=72000)  # 1hr K-weighted energies
+hour_block_energies    = collections.deque(maxlen=72000)  # 1hr K-weighted energies
+segment_block_energies = collections.deque(maxlen=3600)   # 3min sliding window
 
 # K-weighting filter states — must stay in audio callback to stay continuous
 _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
 _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
 
 meter_ms = pyln.Meter(SAMPLE_RATE)
-latest   = {"M": -70.0, "S": -70.0, "H": -70.0, "M_L": -70.0, "M_R": -70.0}
+latest   = {"M": -70.0, "S": -70.0, "H": -70.0, "M_L": -70.0, "M_R": -70.0, "SEG": -70.0}
 lock     = threading.Lock()
 
 current_hour    = datetime.datetime.now().hour
@@ -112,6 +116,7 @@ def audio_callback(indata, frames, time_info, status):
     buf_m_chunks.append(audio)              # deque.append is GIL-atomic
     buf_s_chunks.append(audio)
     hour_block_energies.append(energies)
+    segment_block_energies.append(energies)
 
 
 def compute_loop():
@@ -120,9 +125,10 @@ def compute_loop():
         time.sleep(0.1)
 
         # Snapshot buffer state — fast list copies, GIL-protected
-        m_snap = list(buf_m_chunks)
-        s_snap = list(buf_s_chunks)
-        h_snap = list(hour_block_energies)
+        m_snap   = list(buf_m_chunks)
+        s_snap   = list(buf_s_chunks)
+        h_snap   = list(hour_block_energies)
+        seg_snap = list(segment_block_energies)
 
         M = -70.0
         S = -70.0
@@ -142,12 +148,26 @@ def compute_loop():
         if len(s_snap) >= S_BLOCKS:
             S = lufs_safe(meter_ms, np.concatenate(s_snap))
 
-        H = compute_h(h_snap)
+        H   = compute_h(h_snap)
+        SEG = compute_h(seg_snap)
 
         with lock:
-            latest["M"] = M
-            latest["S"] = S
-            latest["H"] = H
+            latest["M"]   = M
+            latest["S"]   = S
+            latest["H"]   = H
+            latest["SEG"] = SEG
+
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+def _log_hour(dt, lufs_val):
+    """Append one row to the CSV log. Creates file with header if needed."""
+    write_header = not os.path.exists(LOG_PATH)
+    with open(LOG_PATH, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["date", "hour", "lufs"])
+        lufs_str = f"{lufs_val:.1f}" if lufs_val > -70 else "---"
+        w.writerow([dt.strftime("%Y-%m-%d"), dt.strftime("%H"), lufs_str])
 
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
@@ -261,6 +281,32 @@ def draw_panel(surface, fonts, title, val, px, pw, ph, lr_vals=None):
         surface.set_clip(None)
 
 
+def draw_number_only_panel(surface, fonts, title, val, px, pw, py, ph):
+    font_title, _, font_value, _ = fonts
+
+    TITLE_H = 70
+    MARGIN  = 10
+
+    surface.set_clip(pygame.Rect(px, py, pw, ph))
+    t = font_title.render(title, True, (170, 170, 170))
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
+    surface.set_clip(None)
+
+    num_h   = ph - TITLE_H
+    val_str = _fmt_lufs(val)
+    vs_raw  = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
+    scale   = min((pw - MARGIN * 2) / vs_raw.get_width(),
+                  (num_h  - MARGIN * 2) / vs_raw.get_height())
+    new_w   = int(vs_raw.get_width()  * scale)
+    new_h   = int(vs_raw.get_height() * scale)
+    vs      = pygame.transform.smoothscale(vs_raw, (new_w, new_h))
+    vx      = px + pw // 2 - new_w // 2
+    vy      = py + TITLE_H + num_h // 2 - new_h // 2
+    surface.set_clip(pygame.Rect(px, py, pw, ph))
+    surface.blit(vs, (vx, vy))
+    surface.set_clip(None)
+
+
 def main():
     global current_hour, reset_hour_flag, _running
 
@@ -296,10 +342,16 @@ def main():
                     pygame.quit(); sys.exit()
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     _running = False
+                    with lock:
+                        h_val = latest["H"]
+                    _log_hour(datetime.datetime.now(), h_val)
                     pygame.quit(); sys.exit()
 
             now_h = datetime.datetime.now().hour
             if now_h != current_hour:
+                with lock:
+                    h_val = latest["H"]
+                _log_hour(datetime.datetime.now().replace(hour=current_hour, minute=0, second=0), h_val)
                 current_hour = now_h
                 reset_hour_flag = True
 
@@ -309,11 +361,16 @@ def main():
                 vals = dict(latest)
 
             for idx, (title, val, lr) in enumerate([
-                ("MOMENTARY",                   vals["M"], (vals["M_L"], vals["M_R"])),
-                ("SHORT TERM (3s)",             vals["S"], None),
-                (f"THIS HOUR ({current_hour})", vals["H"], None),
+                ("MOMENTARY",      vals["M"], (vals["M_L"], vals["M_R"])),
+                ("SHORT TERM (3s)", vals["S"], None),
             ]):
                 draw_panel(screen, fonts, title, val, idx * pw, pw, H, lr_vals=lr)
+
+            # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
+            half_h = H // 2
+            draw_number_only_panel(screen, fonts, f"THIS HOUR ({current_hour})", vals["H"],  2 * pw, pw, 0,      half_h)
+            pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
+            draw_number_only_panel(screen, fonts, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h)
 
             for i in (1, 2):
                 pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
