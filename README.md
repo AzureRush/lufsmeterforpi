@@ -9,11 +9,17 @@
 | 元件 | 規格 |
 |------|------|
 | 主機 | Raspberry Pi 4B |
-| 作業系統 | Raspberry Pi OS Bookworm 64-bit |
-| 音訊介面 | Focusrite Scarlett 2i2 3rd Gen（USB） |
-| 顯示器 | HDMI，800×480 |
+| 作業系統 | Raspberry Pi OS Trixie（Debian 13）64-bit |
+| 音訊介面 | Focusrite Scarlett 2i2 3rd Gen（USB Type-C → Type-A） |
+| 音源輸入 | Yamaha PM5D Monitor Out L / R（XLR 類比）→ Scarlett 2i2 |
+| 影像輸出 | Micro HDMI → Datavideo DAC-9P（HDMI→SDI）→ KROMA LM6505 SDI 1 |
+| 解析度 | 1080i 60Hz（legacy firmware 模式） |
 
-**訊號鏈：** PC 音訊輸出 → Scarlett 2i2 類比輸入 → Pi → HDMI 顯示器
+---
+
+## 訊號串接
+
+![訊號串接流程](signal_chain.drawio.png)
 
 ---
 
