@@ -46,6 +46,8 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 ## 顯示介面
 
+![螢幕截圖](preview.png)
+
 畫面分為三個垂直面板：
 
 ### MOMENTARY（瞬時）
