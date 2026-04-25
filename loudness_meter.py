@@ -19,44 +19,22 @@ CHANNELS    = 2
 
 def _setup_scarlett():
     """
-    Auto-detect Scarlett in PipeWire, set as default source, wake it if suspended.
-    Returns sounddevice 'default' device index.
+    Auto-detect Scarlett via ALSA/sounddevice directly. Returns device index.
     """
-    # 1. Find Scarlett input source (exclude .monitor loopback)
-    r = subprocess.run(['pactl', 'list', 'sources', 'short'], capture_output=True, text=True)
-    scarlett_source = None
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        name = parts[1] if len(parts) > 1 else ''
-        if ('focusrite' in name.lower() or 'scarlett' in name.lower()) and not name.endswith('.monitor'):
-            scarlett_source = name
-            break
+    devices = sd.query_devices()
+    scarlett_idx = next(
+        (i for i, d in enumerate(devices)
+         if ('scarlett' in d['name'].lower() or 'focusrite' in d['name'].lower())
+         and d['max_input_channels'] > 0),
+        None
+    )
 
-    if not scarlett_source:
+    if scarlett_idx is None:
         print("ERROR: Focusrite Scarlett not found. Connect the device and retry.")
         sys.exit(1)
 
-    # 2. Set as PipeWire default source
-    subprocess.run(['pactl', 'set-default-source', scarlett_source])
-
-    # 3. Wake source with parecord — keeps it RUNNING long enough for sounddevice to connect
-    wake = subprocess.Popen(['parecord', '--device', scarlett_source, '/dev/null'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
-
-    # 4. Open a test stream to take over from parecord, then let parecord go
-    default_idx = next(
-        (i for i, d in enumerate(sd.query_devices())
-         if d['name'] == 'default' and d['max_input_channels'] > 0),
-        None
-    )
-    if default_idx is None:
-        wake.kill(); wake.wait()
-        print("ERROR: No 'default' audio device found in sounddevice.")
-        sys.exit(1)
-
-    wake.kill()
-    wake.wait()
+    print(f"Scarlett detected: [{scarlett_idx}] {devices[scarlett_idx]['name']}")
+    return scarlett_idx
 
     print(f"Scarlett detected: {scarlett_source} → sounddevice [{default_idx}]")
     return default_idx
