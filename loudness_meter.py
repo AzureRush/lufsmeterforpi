@@ -246,7 +246,7 @@ def _y_ratio(val, lo=-60.0, hi=0.0):
         return _SPLIT_FRAC + (1.0 - _SPLIT_FRAC) * (val - _SPLIT_DB) / (hi - _SPLIT_DB)
 
 
-def draw_panel(surface, fonts, title, val, px, pw, ph, lr_vals=None):
+def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None):
     font_title, font_scale, font_value, font_lr = fonts
 
     TITLE_H = 85
@@ -262,9 +262,12 @@ def draw_panel(surface, fonts, title, val, px, pw, ph, lr_vals=None):
 
     color = lufs_to_color(val)
 
-    # Title
+    # Title (cached — never changes)
     surface.set_clip(pygame.Rect(px, 0, pw, TITLE_H))
-    t = font_title.render(title, True, (170, 170, 170))
+    title_key = ('title', title)
+    if title_key not in surf_cache:
+        surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
+    t = surf_cache[title_key]
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, 8))
     surface.set_clip(None)
 
@@ -275,43 +278,53 @@ def draw_panel(surface, fonts, title, val, px, pw, ph, lr_vals=None):
     fill_h = int(BAR_H * _y_ratio(val, LO, HI))
     pygame.draw.rect(surface, color, (BAR_X, BAR_Y + BAR_H - fill_h, BAR_W, fill_h))
 
-    # dB scale
+    # dB scale (labels cached — never change)
     for db in _SCALE_MARKS:
         y = BAR_Y + BAR_H - int(BAR_H * _y_ratio(db, LO, HI))
         is_target  = (db == -23)
         tick_color = (255, 255, 255) if is_target else (110, 110, 110)
         tick_len   = 10 if is_target else 6
         pygame.draw.line(surface, tick_color, (BAR_X - tick_len, y), (BAR_X, y), 1)
-        ls = font_scale.render(str(db), True, tick_color)
+        scale_key = ('scale', db)
+        if scale_key not in surf_cache:
+            surf_cache[scale_key] = font_scale.render(str(db), True, tick_color)
+        ls = surf_cache[scale_key]
         surface.blit(ls, (BAR_X - tick_len - ls.get_width() - 3, y - ls.get_height() // 2))
 
     # Target line
     ty = BAR_Y + BAR_H - int(BAR_H * _y_ratio(TARGET_LUFS, LO, HI))
     pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
 
-    # Big value — auto-scale to panel width
+    # Big value (cached — re-renders only when integer value changes)
     val_str = _fmt_lufs(val)
-    vs_raw  = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
-    scale   = min((pw - MARGIN * 2) / vs_raw.get_width(),
-                  (BAR_H - MARGIN * 2) / vs_raw.get_height())
-    new_w   = int(vs_raw.get_width()  * scale)
-    new_h   = int(vs_raw.get_height() * scale)
-    vs      = pygame.transform.smoothscale(vs_raw, (new_w, new_h))
-    vx      = px + pw // 2 - new_w // 2
-    vy      = BAR_Y + BAR_H // 2 - new_h // 2
+    num_key = ('num_bar', val_str, pw, BAR_H)
+    if num_key not in surf_cache:
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
+        sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
+                     (BAR_H - MARGIN * 2) / vs_raw.get_height())
+        surf_cache[num_key] = pygame.transform.smoothscale(
+            vs_raw, (int(vs_raw.get_width() * sc), int(vs_raw.get_height() * sc)))
+    vs           = surf_cache[num_key]
+    new_w, new_h = vs.get_size()
+    vx           = px + pw // 2 - new_w // 2
+    vy           = BAR_Y + BAR_H // 2 - new_h // 2
     surface.set_clip(pygame.Rect(px, BAR_Y, pw, BAR_H))
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
 
-    # L/R per-channel text at bottom of bar (Momentary only)
+    # L/R per-channel text at bottom of bar (Momentary only, cached by string)
     if lr_vals is not None:
         l_val, r_val = lr_vals
         l_str = _fmt_lufs(l_val, "L:")
         r_str = _fmt_lufs(r_val, "R:")
-        l_surf = render_outlined(font_lr, l_str, (180, 180, 180), offset=2)
-        r_surf = render_outlined(font_lr, r_str, (180, 180, 180), offset=2)
-        gap    = 4
-        total_h = l_surf.get_height() + gap + r_surf.get_height()
+        for lr_str in (l_str, r_str):
+            lr_key = ('lr', lr_str)
+            if lr_key not in surf_cache:
+                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (180, 180, 180), offset=2)
+        l_surf   = surf_cache[('lr', l_str)]
+        r_surf   = surf_cache[('lr', r_str)]
+        gap      = 4
+        total_h  = l_surf.get_height() + gap + r_surf.get_height()
         ty_start = BAR_Y + BAR_H - total_h - 6
         surface.set_clip(pygame.Rect(BAR_X, BAR_Y, BAR_W, BAR_H))
         surface.blit(l_surf, (BAR_X + BAR_W // 2 - l_surf.get_width() // 2, ty_start))
@@ -319,27 +332,33 @@ def draw_panel(surface, fonts, title, val, px, pw, ph, lr_vals=None):
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, title, val, px, pw, py, ph):
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph):
     font_title, _, font_value, _ = fonts
 
     TITLE_H = 70
     MARGIN  = 10
 
     surface.set_clip(pygame.Rect(px, py, pw, ph))
-    t = font_title.render(title, True, (170, 170, 170))
+    title_key = ('title', title)
+    if title_key not in surf_cache:
+        surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
+    t = surf_cache[title_key]
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
     surface.set_clip(None)
 
     num_h   = ph - TITLE_H
     val_str = _fmt_lufs(val)
-    vs_raw  = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
-    scale   = min((pw - MARGIN * 2) / vs_raw.get_width(),
-                  (num_h  - MARGIN * 2) / vs_raw.get_height())
-    new_w   = int(vs_raw.get_width()  * scale)
-    new_h   = int(vs_raw.get_height() * scale)
-    vs      = pygame.transform.smoothscale(vs_raw, (new_w, new_h))
-    vx      = px + pw // 2 - new_w // 2
-    vy      = py + TITLE_H + num_h // 2 - new_h // 2
+    num_key = ('num_panel', val_str, pw, num_h)
+    if num_key not in surf_cache:
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
+        sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
+                     (num_h - MARGIN * 2) / vs_raw.get_height())
+        surf_cache[num_key] = pygame.transform.smoothscale(
+            vs_raw, (int(vs_raw.get_width() * sc), int(vs_raw.get_height() * sc)))
+    vs           = surf_cache[num_key]
+    new_w, new_h = vs.get_size()
+    vx           = px + pw // 2 - new_w // 2
+    vy           = py + TITLE_H + num_h // 2 - new_h // 2
     surface.set_clip(pygame.Rect(px, py, pw, ph))
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
@@ -365,6 +384,8 @@ def main():
     font_value = pygame.font.SysFont("monospace", 250, bold=True)
     font_lr    = pygame.font.SysFont("monospace", 90, bold=True)
     fonts = (font_title, font_scale, font_value, font_lr)
+
+    surf_cache = {}   # surface cache: keyed by (type, content, ...) — rebuilt only on change
 
     pw = W // 3
 
@@ -404,13 +425,13 @@ def main():
                 ("MOMENTARY",      vals["M"], (vals["M_L"], vals["M_R"])),
                 ('SHORT TERM (3")', vals["S"], None),
             ]):
-                draw_panel(screen, fonts, title, val, idx * pw, pw, H, lr_vals=lr)
+                draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr)
 
             # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
             half_h = H // 2
-            draw_number_only_panel(screen, fonts, f"THIS HOUR ({current_hour})", vals["H"],  2 * pw, pw, 0,      half_h)
+            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],  2 * pw, pw, 0,      half_h)
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-            draw_number_only_panel(screen, fonts, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h)
+            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h)
 
             for i in (1, 2):
                 pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
