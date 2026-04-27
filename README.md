@@ -33,7 +33,7 @@
 ## 安裝
 
 ```bash
-pip3 install sounddevice pyloudnorm pygame scipy numpy
+pip3 install sounddevice pygame scipy numpy
 ```
 
 程式啟動時會自動偵測 Focusrite Scarlett，無需手動設定 device index。
@@ -127,7 +127,7 @@ cat ~/loudness_meter/loudness_log.csv
   → K-weighting + 寫入 deque（每 50ms，CPU 占用 < 1%）
 
 compute_loop（daemon thread，10Hz）
-  → 讀取 snapshot → pyloudnorm 計算 M/S → 自製 gating 計算 H 和 SEG
+  → 讀取 snapshot → K-weighted mean-square 計算 M/S → 自製 gating 計算 H 和 SEG
 
 pygame main thread（20fps）
   → 讀取 latest dict → 渲染畫面
@@ -137,8 +137,8 @@ pygame main thread（20fps）
 
 | 指標 | 方法 | 窗口 |
 |------|------|------|
-| M | pyloudnorm `integrated_loudness()` | 400ms 滑動 |
-| S | pyloudnorm `integrated_loudness()` | 3s 滑動 |
+| M | K-weighted mean-square，無 gating（符合 R128） | 400ms 滑動 |
+| S | K-weighted mean-square，無 gating（符合 R128） | 3s 滑動 |
 | H | 自製 EBU R128 two-stage gating | 整點起累積 |
 | SEG | 同 H | 3 分鐘滑動 |
 | L/R | K-weighted mean-square per channel | 400ms 滑動 |
@@ -168,9 +168,7 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
 ## 已知限制
 
-- `compute_loop` 實際更新率約 4Hz（pyloudnorm 計算耗時），M 的 400ms 窗口在此速率下仍可接受
 - 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
-- M/S 對短窗口使用 `integrated_loudness()` 是近似，非嚴格 R128 Momentary/Short-term 定義
 - SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
 - KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
 

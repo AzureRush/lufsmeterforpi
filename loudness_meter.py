@@ -1,6 +1,5 @@
 import numpy as np
 import sounddevice as sd
-import pyloudnorm as pyln
 import pygame
 import sys
 import subprocess
@@ -36,8 +35,6 @@ def _setup_scarlett():
     print(f"Scarlett detected: [{scarlett_idx}] {devices[scarlett_idx]['name']}")
     return scarlett_idx
 
-    print(f"Scarlett detected: {scarlett_source} → sounddevice [{default_idx}]")
-    return default_idx
 BLOCK_SIZE  = 2400          # 50ms per block
 
 MOMENTARY_WIN    = 0.4      # 400ms = 8 blocks
@@ -68,7 +65,6 @@ segment_block_energies = collections.deque(maxlen=3600)   # 3min sliding window
 _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
 _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
 
-meter_ms = pyln.Meter(SAMPLE_RATE)
 latest   = {"M": -70.0, "S": -70.0, "H": -70.0, "M_L": -70.0, "M_R": -70.0, "SEG": -70.0}
 lock     = threading.Lock()
 
@@ -84,14 +80,6 @@ def _energy_to_lufs(e):
 
 def _fmt_lufs(v, prefix=""):
     return f"{prefix}{int(round(v))}" if v > -70 else f"{prefix}---"
-
-
-def lufs_safe(m, audio):
-    try:
-        v = m.integrated_loudness(audio)
-        return v if np.isfinite(v) else -70.0
-    except Exception:
-        return -70.0
 
 
 def k_weight_and_energy(audio):
@@ -157,18 +145,26 @@ def compute_loop():
 
         if len(m_snap) >= M_BLOCKS:
             m_audio = np.concatenate(m_snap)
-            M = lufs_safe(meter_ms, m_audio)
 
-            # Per-channel K-weighted level (non-stateful, fine for 400ms window)
+            # K-weight 各聲道，energy 相加 → LUFS（無 gating，符合 R128 M 定義）
+            e_total = 0.0
             for ch_idx, key in enumerate(("M_L", "M_R")):
                 sig = lfilter(_PRE_B, _PRE_A, m_audio[:, ch_idx])
                 sig = lfilter(_RLB_B, _RLB_A, sig)
                 e   = float(np.mean(sig ** 2))
+                e_total += e
                 with lock:
                     latest[key] = _energy_to_lufs(e) if e > 1e-12 else -70.0
+            M = _energy_to_lufs(e_total) if e_total > 1e-12 else -70.0
 
         if len(s_snap) >= S_BLOCKS:
-            S = lufs_safe(meter_ms, np.concatenate(s_snap))
+            s_audio = np.concatenate(s_snap)
+            e_total = 0.0
+            for ch in range(CHANNELS):
+                sig = lfilter(_PRE_B, _PRE_A, s_audio[:, ch])
+                sig = lfilter(_RLB_B, _RLB_A, sig)
+                e_total += float(np.mean(sig ** 2))
+            S = _energy_to_lufs(e_total) if e_total > 1e-12 else -70.0
 
         H   = compute_h(h_snap)
         SEG = compute_h(seg_snap)
