@@ -182,6 +182,8 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 - SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
 - KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
 
+---
+
 ## 參考(References)
 + https://github.com/csteinmetz1/pyloudnorm
 + [pyloudnorm: A simple yet flexible loudness meter in Python](https://csteinmetz1.github.io/pyloudnorm-eval/paper/pyloudnorm_preprint.pdf)
