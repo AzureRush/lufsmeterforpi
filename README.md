@@ -37,7 +37,17 @@ pip3 install sounddevice pygame scipy numpy
 ```
 
 程式啟動時會自動偵測 Focusrite Scarlett，無需手動設定 device index。
-若 Scarlett 未接上，程式會印出錯誤訊息並退出。
+若未偵測到 Scarlett，會列出所有可用輸入裝置並提示選擇：
+
+```
+Scarlett not found. Available input devices:
+  1. USB Audio Device: Audio (hw:2,0)  (ch: 2)
+  2. Built-in Audio: Audio (hw:0,0)   (ch: 2)
+
+Select device [1-2]: _
+```
+
+輸入對應編號即可繼續執行，支援任何 ALSA 可識別的 USB 音訊介面。
 
 ---
 
