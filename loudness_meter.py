@@ -40,8 +40,8 @@ BLOCK_SIZE  = 2400          # 50ms per block
 MOMENTARY_WIN    = 0.4      # 400ms = 8 blocks
 SHORTTERM_WIN    = 3.0      # 3s    = 60 blocks
 TARGET_LUFS      = -23.0
-YELLOW_THRESHOLD = -17.0
-RED_THRESHOLD    = -14.0
+YELLOW_THRESHOLD = -23.0
+RED_THRESHOLD    = -10.0
 FPS              = 20
 
 M_BLOCKS = 8    # blocks needed for M window
@@ -382,7 +382,7 @@ def main():
 
             for idx, (title, val, lr) in enumerate([
                 ("MOMENTARY",      vals["M"], (vals["M_L"], vals["M_R"])),
-                ("SHORT TERM (3s)", vals["S"], None),
+                ('SHORT TERM (3")', vals["S"], None),
             ]):
                 draw_panel(screen, fonts, title, val, idx * pw, pw, H, lr_vals=lr)
 

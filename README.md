@@ -62,7 +62,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 - meter bar 顯示當前電平
 - 底部顯示 **L / R 個別聲道電平**，方便監看立體聲平衡
 
-### SHORT TERM 3s（短期）
+### SHORT TERM 3"（短期）
 - 3 秒滑動窗口，反應近期平均音量
 - meter bar 顯示當前電平
 
@@ -81,9 +81,9 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 | 顏色 | 範圍 |
 |------|------|
-| 綠色 | < −17 LUFS |
-| 黃色 | −17 ~ −14 LUFS |
-| 紅色 | > −14 LUFS |
+| 綠色 | < −23 LUFS |
+| 黃色 | −23 ~ −10 LUFS |
+| 紅色 | > −10 LUFS |
 
 白色橫線標示 **−23 LUFS** 目標值（EBU R128 廣播標準）。
 
