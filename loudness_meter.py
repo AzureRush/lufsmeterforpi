@@ -18,22 +18,42 @@ CHANNELS    = 2
 
 def _setup_scarlett():
     """
-    Auto-detect Scarlett via ALSA/sounddevice directly. Returns device index.
+    Auto-detect Focusrite Scarlett. If not found, list all input devices and
+    prompt the user to select one.
     """
     devices = sd.query_devices()
+
+    # 優先自動偵測 Scarlett / Focusrite
     scarlett_idx = next(
         (i for i, d in enumerate(devices)
          if ('scarlett' in d['name'].lower() or 'focusrite' in d['name'].lower())
          and d['max_input_channels'] > 0),
         None
     )
+    if scarlett_idx is not None:
+        print(f"Scarlett detected: [{scarlett_idx}] {devices[scarlett_idx]['name']}")
+        return scarlett_idx
 
-    if scarlett_idx is None:
-        print("ERROR: Focusrite Scarlett not found. Connect the device and retry.")
+    # 找不到 Scarlett → 列出所有可用輸入裝置
+    input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
+    if not input_devices:
+        print("ERROR: No input devices found.")
         sys.exit(1)
 
-    print(f"Scarlett detected: [{scarlett_idx}] {devices[scarlett_idx]['name']}")
-    return scarlett_idx
+    print("Scarlett not found. Available input devices:")
+    for n, (i, d) in enumerate(input_devices, 1):
+        print(f"  {n}. {d['name']}  (ch: {d['max_input_channels']})")
+
+    while True:
+        try:
+            choice = int(input(f"Select device [1-{len(input_devices)}]: "))
+            if 1 <= choice <= len(input_devices):
+                idx, dev = input_devices[choice - 1]
+                print(f"Using: [{idx}] {dev['name']}")
+                return idx
+        except (ValueError, EOFError):
+            pass
+        print(f"  Please enter a number between 1 and {len(input_devices)}.")
 
 BLOCK_SIZE  = 2400          # 50ms per block
 
