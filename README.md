@@ -1,6 +1,11 @@
 # EBU R128 即時響度計
 
-在 Raspberry Pi 4B 上運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。
+[![hackmd-github-sync-badge](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w/badge)](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w)
+
+
+用小型系統架構提供持續的響度(Loudness)監測方案，提供只有 Mixer 系統內建 Peak Meter 環境下以外的儀表，讓聲音控制更有參考性。
+
+本系統是在 Raspberry Pi 4B 上，以 python 為架構運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。
 
 ---
 
@@ -12,14 +17,16 @@
 | 作業系統 | Raspberry Pi OS Trixie（Debian 13）64-bit |
 | 音訊介面 | Focusrite Scarlett 2i2 3rd Gen（USB Type-C → Type-A） |
 | 音源輸入 | Yamaha PM5D Monitor Out L / R（XLR 類比）→ Scarlett 2i2 |
-| 影像輸出 | Micro HDMI → Datavideo DAC-9P（HDMI→SDI）→ KROMA LM6505 SDI 1 |
-| 解析度 | 1080i 60Hz（legacy firmware 模式） |
+| 影像輸出 | Micro HDMI(Pi Out) → (optional)Datavideo DAC-9P（HDMI→SDI）→ (optional)KROMA LM6505 SDI 1 |
+| 解析度 | (optional)1080i 60Hz（legacy firmware 模式） 此為配合副控顯示系統 |
+
+除了 Raspberry Pi 以外的設備應都可自行更換並適應。
 
 ---
 
 ## 訊號串接
 
-![訊號串接流程](signal_chain.drawio.png)
+![訊號串接流程](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/signal_chain.drawio.png)
 
 ---
 
@@ -46,7 +53,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 ## 顯示介面
 
-![螢幕截圖](preview.png)
+![螢幕截圖](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/preview.png)
 
 畫面分為三個垂直面板：
 
@@ -165,4 +172,10 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 - 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
 - M/S 對短窗口使用 `integrated_loudness()` 是近似，非嚴格 R128 Momentary/Short-term 定義
 - SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
-- True Peak 未實作（前端硬體設備已具備 peak 偵測功能）
+- KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
+
+## 參考(References)
++ https://github.com/csteinmetz1/pyloudnorm
++ [pyloudnorm: A simple yet flexible loudness meter in Python](https://csteinmetz1.github.io/pyloudnorm-eval/paper/pyloudnorm_preprint.pdf)
++ [ITU-R Algorithms to measure audio programme
+loudness and true-peak audio level](http://magnetic.beep.pl/Loudness/2016/R-REC-BS.1770-4-201510.pdf)
