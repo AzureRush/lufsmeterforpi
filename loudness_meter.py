@@ -256,14 +256,13 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None)
     font_title, font_scale, font_value, font_lr = fonts
 
     TITLE_H = 85
-    SCALE_W = 80
     PAD     = 6
     MARGIN  = 10
     LO, HI  = -60.0, 0.0
 
     BAR_Y = TITLE_H
-    BAR_X = px + SCALE_W + PAD
-    BAR_W = pw - SCALE_W - PAD * 2
+    BAR_X = px + PAD
+    BAR_W = pw - PAD * 2
     BAR_H = ph - TITLE_H - PAD
 
     color = lufs_to_color(val)
@@ -284,57 +283,47 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None)
     fill_h = int(BAR_H * _y_ratio(val, LO, HI))
     pygame.draw.rect(surface, color, (BAR_X, BAR_Y + BAR_H - fill_h, BAR_W, fill_h))
 
-    # dB scale (labels cached — never change)
-    for db in _SCALE_MARKS:
-        y = BAR_Y + BAR_H - int(BAR_H * _y_ratio(db, LO, HI))
-        is_target  = (db == -23)
-        tick_color = (255, 255, 255) if is_target else (110, 110, 110)
-        tick_len   = 10 if is_target else 6
-        pygame.draw.line(surface, tick_color, (BAR_X - tick_len, y), (BAR_X, y), 1)
-        scale_key = ('scale', db)
-        if scale_key not in surf_cache:
-            surf_cache[scale_key] = font_scale.render(str(db), True, tick_color)
-        ls = surf_cache[scale_key]
-        surface.blit(ls, (BAR_X - tick_len - ls.get_width() - 3, y - ls.get_height() // 2))
-
-    # Target line
+    # -23 LUFS 標準線（加粗，不顯示其他刻度）
     ty = BAR_Y + BAR_H - int(BAR_H * _y_ratio(TARGET_LUFS, LO, HI))
-    pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 2)
+    pygame.draw.line(surface, (255, 255, 255), (BAR_X, ty), (BAR_X + BAR_W, ty), 4)
 
-    # Big value (cached — re-renders only when integer value changes)
-    val_str = _fmt_lufs(val)
-    num_key = ('num_bar', val_str, pw, BAR_H)
+    # 大數字 — 標準線以上區域，垂直置中
+    num_zone_h = ty - BAR_Y
+    val_str    = _fmt_lufs(val)
+    num_key    = ('num_bar', val_str, pw, num_zone_h)
     if num_key not in surf_cache:
         vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
         sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
-                     (BAR_H - MARGIN * 2) / vs_raw.get_height())
+                     (num_zone_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = pygame.transform.smoothscale(
             vs_raw, (int(vs_raw.get_width() * sc), int(vs_raw.get_height() * sc)))
     vs           = surf_cache[num_key]
     new_w, new_h = vs.get_size()
     vx           = px + pw // 2 - new_w // 2
-    vy           = BAR_Y + BAR_H // 2 - new_h // 2
-    surface.set_clip(pygame.Rect(px, BAR_Y, pw, BAR_H))
+    vy           = BAR_Y + num_zone_h // 2 - new_h // 2
+    surface.set_clip(pygame.Rect(px, BAR_Y, pw, num_zone_h))
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
 
-    # L/R per-channel text at bottom of bar (Momentary only, cached by string)
+    # L/R — 標準線以下區域，垂直置中，白色，格式 "L -23"
     if lr_vals is not None:
         l_val, r_val = lr_vals
-        l_str = _fmt_lufs(l_val, "L:")
-        r_str = _fmt_lufs(r_val, "R:")
+        l_str = _fmt_lufs(l_val, "L ")
+        r_str = _fmt_lufs(r_val, "R ")
         for lr_str in (l_str, r_str):
             lr_key = ('lr', lr_str)
             if lr_key not in surf_cache:
-                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (180, 180, 180), offset=2)
-        l_surf   = surf_cache[('lr', l_str)]
-        r_surf   = surf_cache[('lr', r_str)]
-        gap      = 4
-        total_h  = l_surf.get_height() + gap + r_surf.get_height()
-        ty_start = BAR_Y + BAR_H - total_h - 6
-        surface.set_clip(pygame.Rect(BAR_X, BAR_Y, BAR_W, BAR_H))
-        surface.blit(l_surf, (BAR_X + BAR_W // 2 - l_surf.get_width() // 2, ty_start))
-        surface.blit(r_surf, (BAR_X + BAR_W // 2 - r_surf.get_width() // 2, ty_start + l_surf.get_height() + gap))
+                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=2)
+        l_surf    = surf_cache[('lr', l_str)]
+        r_surf    = surf_cache[('lr', r_str)]
+        lr_zone_y = ty
+        lr_zone_h = BAR_Y + BAR_H - ty
+        gap       = 12
+        total_h   = l_surf.get_height() + gap + r_surf.get_height()
+        lr_start  = lr_zone_y + lr_zone_h // 2 - total_h // 2
+        surface.set_clip(pygame.Rect(BAR_X, lr_zone_y, BAR_W, lr_zone_h))
+        surface.blit(l_surf, (px + pw // 2 - l_surf.get_width() // 2, lr_start))
+        surface.blit(r_surf, (px + pw // 2 - r_surf.get_width() // 2, lr_start + l_surf.get_height() + gap))
         surface.set_clip(None)
 
 
