@@ -93,6 +93,9 @@ current_hour    = datetime.datetime.now().hour
 reset_hour_flag = False
 _running        = True
 
+prev_H   = None   # last completed hour's LUFS（整點 rollover 時更新）
+prev_SEG = None   # last 3-min fixed segment's LUFS（每 3 分鐘快照）
+
 
 # ─── Audio processing ─────────────────────────────────────────────────────────
 def _energy_to_lufs(e):
@@ -335,11 +338,12 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None)
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph):
-    font_title, _, font_value, _ = fonts
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None):
+    font_title, _, font_value, font_lr = fonts
 
-    TITLE_H = 70
-    MARGIN  = 10
+    TITLE_H  = 70
+    DELTA_H  = 110   # 底部保留給 delta 小字（只有 delta 不為 None 時使用）
+    MARGIN   = 10
 
     surface.set_clip(pygame.Rect(px, py, pw, ph))
     title_key = ('title', title)
@@ -349,7 +353,7 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
     surface.set_clip(None)
 
-    num_h   = ph - TITLE_H
+    num_h   = ph - TITLE_H - (DELTA_H if delta is not None else 0)
     val_str = _fmt_lufs(val)
     num_key = ('num_panel', val_str, pw, num_h)
     if num_key not in surf_cache:
@@ -366,9 +370,23 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
 
+    # Delta vs 上一區段（可選）
+    if delta is not None:
+        d_str   = (f"+{delta}" if delta > 0 else str(delta))
+        d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
+        d_key   = ('delta', d_str, d_color)
+        if d_key not in surf_cache:
+            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=2)
+        ds   = surf_cache[d_key]
+        d_zone_y = py + TITLE_H + num_h
+        dy   = d_zone_y + (DELTA_H - ds.get_height()) // 2
+        surface.set_clip(pygame.Rect(px, d_zone_y, pw, DELTA_H))
+        surface.blit(ds, (px + pw // 2 - ds.get_width() // 2, dy))
+        surface.set_clip(None)
+
 
 def main():
-    global current_hour, reset_hour_flag, _running
+    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG
 
     DEVICE = _setup_scarlett()
 
@@ -389,6 +407,8 @@ def main():
     fonts = (font_title, font_scale, font_value, font_lr)
 
     surf_cache = {}   # surface cache: keyed by (type, content, ...) — rebuilt only on change
+
+    seg_snapshot_time = time.time() + 180.0   # 3 分鐘後第一次快照
 
     pw = W // 3
 
@@ -416,8 +436,16 @@ def main():
                 with lock:
                     h_val = latest["H"]
                 _log_hour(datetime.datetime.now().replace(hour=current_hour, minute=0, second=0), h_val)
+                prev_H = h_val if h_val > -70 else None   # 存前一小時值
                 current_hour = now_h
                 reset_hour_flag = True
+
+            now_t = time.time()
+            if now_t >= seg_snapshot_time:
+                with lock:
+                    seg_val = latest["SEG"]
+                prev_SEG = seg_val if seg_val > -70 else None   # 每 3 分鐘快照
+                seg_snapshot_time = now_t + 180.0
 
             screen.fill((15, 15, 15))
 
@@ -431,10 +459,12 @@ def main():
                 draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr)
 
             # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
-            half_h = H // 2
-            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],  2 * pw, pw, 0,      half_h)
+            half_h    = H // 2
+            h_delta   = round(vals["H"]   - prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
+            seg_delta = round(vals["SEG"] - prev_SEG) if prev_SEG is not None and vals["SEG"] > -70 else None
+            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta)
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h)
+            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta)
 
             for i in (1, 2):
                 pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
