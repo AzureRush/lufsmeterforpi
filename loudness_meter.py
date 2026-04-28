@@ -217,29 +217,25 @@ def _log_hour(dt, lufs_val):
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
-    """3 層渲染：① 黑色外框（大偏移）→ ② 同色描邊（中偏移）→ ③ 填充，讓筆畫更粗壯。"""
+    """3 層渲染：黑色外框 → 同色描邊（加粗筆畫）→ 填充。"""
     inner = max(1, offset // 2)
 
     shadow_surf = font.render(text, True, outline_color)
-    stroke_surf = font.render(text, True, color)
-    base_surf   = font.render(text, True, color)
+    color_surf  = font.render(text, True, color)   # stroke 和 fill 共用同一張
 
-    w = base_surf.get_width()  + offset * 2
-    h = base_surf.get_height() + offset * 2
+    w = color_surf.get_width()  + offset * 2
+    h = color_surf.get_height() + offset * 2
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
-    # Layer 1: 黑色外框（8 方向，大偏移）
     for dx, dy in [(-offset, 0), (offset, 0), (0, -offset), (0, offset),
                    (-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset)]:
         surf.blit(shadow_surf, (dx + offset, dy + offset))
 
-    # Layer 2: 同色描邊（8 方向，小偏移，增加筆畫厚度）
     for dx, dy in [(-inner, 0), (inner, 0), (0, -inner), (0, inner),
                    (-inner, -inner), (inner, -inner), (-inner, inner), (inner, inner)]:
-        surf.blit(stroke_surf, (dx + offset, dy + offset))
+        surf.blit(color_surf, (dx + offset, dy + offset))
 
-    # Layer 3: 填充
-    surf.blit(base_surf, (offset, offset))
+    surf.blit(color_surf, (offset, offset))
     return surf
 
 
@@ -277,6 +273,8 @@ def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3
     N       = 20
     n       = len(hist_data)
     block_w = max(4, (zone_w - gap * (N - 1)) // N)
+    # 單一 SRCALPHA surface 重複使用，避免每格 allocate 一張新的
+    fill_surf = pygame.Surface((block_w, zone_h), pygame.SRCALPHA)
     for i, lufs_val in enumerate(hist_data):
         slot  = N - n + i                        # 右對齊
         bx    = zone_x + slot * (block_w + gap)
@@ -284,11 +282,9 @@ def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3
         bh    = max(4, int(zone_h * ratio))
         by    = zone_y + zone_h - bh
         r, g, b = lufs_to_color(lufs_val)
-        # 70% 不透明填充（SRCALPHA surface）
-        fill_surf = pygame.Surface((block_w, bh), pygame.SRCALPHA)
-        fill_surf.fill((r // 2, g // 2, b // 2, 178))
-        surface.blit(fill_surf, (bx, by))
-        # 白色描邊（100% 不透明）
+        fill_surf.fill((0, 0, 0, 0))
+        fill_surf.fill((r // 2, g // 2, b // 2, 178), (0, zone_h - bh, block_w, bh))
+        surface.blit(fill_surf, (bx, zone_y))
         pygame.draw.rect(surface, (255, 255, 255), (bx, by, block_w, bh), 2)
 
 
@@ -381,19 +377,17 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     OUTLINE_OFFSET = 4
     MARGIN         = 10
 
-    # ① 歷史色塊（最底層，覆蓋整個面板高度，SEGMENT 用）
     if history is not None and len(history) > 0:
         pygame.draw.rect(surface, (15, 15, 15), (px, py, pw, ph))
         draw_history_strip(surface, history, px + 6, py + 6, pw - 12, ph - 12)
 
-    # 後續繪製都限制在面板範圍內
     surface.set_clip(pygame.Rect(px, py, pw, ph))
 
-    # ② Title（80% 不透明暗色背景，防止被歷史色塊蓋住）
+    # title_bg: 80% 不透明暗色背景，讓 title 在歷史色塊上仍可見
     bg_key = ('title_bg', pw, TITLE_H)
     if bg_key not in surf_cache:
         s = pygame.Surface((pw, TITLE_H), pygame.SRCALPHA)
-        s.fill((15, 15, 15, 204))   # 204 / 255 ≈ 80%
+        s.fill((15, 15, 15, 204))
         surf_cache[bg_key] = s
     surface.blit(surf_cache[bg_key], (px, py))
 
@@ -403,7 +397,6 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     t = surf_cache[title_key]
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 10))
 
-    # ③ 大數字（垂直置中於 num zone）
     num_h   = ph - TITLE_H
     val_str = _fmt_lufs(val)
     num_key = ('num_panel', val_str, pw, num_h)
@@ -411,34 +404,28 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
         vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=OUTLINE_OFFSET)
         sc_val = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_h - MARGIN * 2) / vs_raw.get_height())
-        surf_cache[num_key] = pygame.transform.smoothscale(
-            vs_raw, (int(vs_raw.get_width() * sc_val), int(vs_raw.get_height() * sc_val)))
-    vs           = surf_cache[num_key]
+        surf_cache[num_key] = (
+            pygame.transform.smoothscale(
+                vs_raw, (int(vs_raw.get_width() * sc_val), int(vs_raw.get_height() * sc_val))),
+            sc_val,
+        )
+    vs, sc = surf_cache[num_key]
     new_w, new_h = vs.get_size()
     vx           = px + pw // 2 - new_w // 2
     vy           = py + TITLE_H + num_h // 2 - new_h // 2
     surface.blit(vs, (vx, vy))
 
-    # ④ Delta（左下角，對齊大數字 "-" 中心，緊接數字底部）
     if delta is not None:
-        d_str   = str(delta)   # 正數不加 +，靠紅色區分
+        d_str   = str(delta)
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
         d_key   = ('delta', d_str, d_color)
         if d_key not in surf_cache:
             surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=2)
         ds = surf_cache[d_key]
 
-        # 計算 sc 用於定位（font.size 比 font.render 輕量）
-        fw, fh = font_value.size(val_str)
-        sc = min((pw - MARGIN * 2) / (fw + OUTLINE_OFFSET * 2),
-                 (num_h - MARGIN * 2) / (fh + OUTLINE_OFFSET * 2))
-
-        # X：大數字 "-" 號中心
-        content_left = vx + int(OUTLINE_OFFSET * sc)
-        minus_w_sc   = int(font_value.size('-')[0] * sc)
-        delta_x      = content_left + minus_w_sc // 2
-
-        # Y：緊接數字底部，不超出面板底部
+        content_left   = vx + int(OUTLINE_OFFSET * sc)
+        minus_w_sc     = int(font_value.size('-')[0] * sc)
+        delta_x        = content_left + minus_w_sc // 2
         num_bottom     = vy + new_h
         delta_half_h   = ds.get_height() // 2
         delta_center_y = min(py + ph - delta_half_h - 6,
