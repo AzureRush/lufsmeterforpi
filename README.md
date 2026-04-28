@@ -91,7 +91,8 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 | 顏色 | 範圍 |
 |------|------|
-| 綠色 | < −23 LUFS |
+| 藍色 | < −30 LUFS |
+| 綠色 | −30 ~ −23 LUFS |
 | 黃色 | −23 ~ −10 LUFS |
 | 紅色 | > −10 LUFS |
 

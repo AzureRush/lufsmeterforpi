@@ -60,6 +60,7 @@ BLOCK_SIZE  = 2400          # 50ms per block
 MOMENTARY_WIN    = 0.4      # 400ms = 8 blocks
 SHORTTERM_WIN    = 3.0      # 3s    = 60 blocks
 TARGET_LUFS      = -23.0
+BLUE_THRESHOLD   = -30.0
 YELLOW_THRESHOLD = -23.0
 RED_THRESHOLD    = -10.0
 FPS              = 20
@@ -228,8 +229,10 @@ def lufs_to_color(val):
         return (220, 50, 50)
     elif val >= YELLOW_THRESHOLD:
         return (220, 200, 50)
-    else:
+    elif val >= BLUE_THRESHOLD:
         return (50, 200, 80)
+    else:
+        return (50, 130, 220)
 
 
 _SCALE_MARKS = [0, -10, -20, -23, -30, -40, -50, -60]
