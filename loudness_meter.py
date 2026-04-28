@@ -96,6 +96,9 @@ _running        = True
 prev_H   = None   # last completed hour's LUFS（整點 rollover 時更新）
 prev_SEG = None   # last 3-min fixed segment's LUFS（每 3 分鐘快照）
 
+st_history  = collections.deque(maxlen=20)  # SHORT TERM 每 3 秒快照
+seg_history = collections.deque(maxlen=20)  # SEGMENT 每 3 分鐘快照
+
 
 # ─── Audio processing ─────────────────────────────────────────────────────────
 def _energy_to_lufs(e):
@@ -214,16 +217,29 @@ def _log_hour(dt, lufs_val):
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
-    """Render text with a solid outline by blitting 8 offset shadow copies."""
-    shadow  = font.render(text, True, outline_color)
-    base    = font.render(text, True, color)
-    w = base.get_width()  + offset * 2
-    h = base.get_height() + offset * 2
+    """3 層渲染：① 黑色外框（大偏移）→ ② 同色描邊（中偏移）→ ③ 填充，讓筆畫更粗壯。"""
+    inner = max(1, offset // 2)
+
+    shadow_surf = font.render(text, True, outline_color)
+    stroke_surf = font.render(text, True, color)
+    base_surf   = font.render(text, True, color)
+
+    w = base_surf.get_width()  + offset * 2
+    h = base_surf.get_height() + offset * 2
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
+
+    # Layer 1: 黑色外框（8 方向，大偏移）
     for dx, dy in [(-offset, 0), (offset, 0), (0, -offset), (0, offset),
                    (-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset)]:
-        surf.blit(shadow, (dx + offset, dy + offset))
-    surf.blit(base, (offset, offset))
+        surf.blit(shadow_surf, (dx + offset, dy + offset))
+
+    # Layer 2: 同色描邊（8 方向，小偏移，增加筆畫厚度）
+    for dx, dy in [(-inner, 0), (inner, 0), (0, -inner), (0, inner),
+                   (-inner, -inner), (inner, -inner), (-inner, inner), (inner, inner)]:
+        surf.blit(stroke_surf, (dx + offset, dy + offset))
+
+    # Layer 3: 填充
+    surf.blit(base_surf, (offset, offset))
     return surf
 
 
@@ -252,7 +268,31 @@ def _y_ratio(val, lo=-60.0, hi=0.0):
         return _SPLIT_FRAC + (1.0 - _SPLIT_FRAC) * (val - _SPLIT_DB) / (hi - _SPLIT_DB)
 
 
-def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None):
+_HIST_LO  = -40.0   # 歷史色塊高度 0%
+_HIST_REF = TARGET_LUFS   # 歷史色塊高度 100%（-23 LUFS = 滿格）
+
+
+def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3):
+    """20格 FIFO 歷史色塊：-23 LUFS 為滿格，暗化閾值色 70% 透明度 + 白色描邊。"""
+    N       = 20
+    n       = len(hist_data)
+    block_w = max(4, (zone_w - gap * (N - 1)) // N)
+    for i, lufs_val in enumerate(hist_data):
+        slot  = N - n + i                        # 右對齊
+        bx    = zone_x + slot * (block_w + gap)
+        ratio = min(1.0, max(0.0, (lufs_val - _HIST_LO) / (_HIST_REF - _HIST_LO)))
+        bh    = max(4, int(zone_h * ratio))
+        by    = zone_y + zone_h - bh
+        r, g, b = lufs_to_color(lufs_val)
+        # 70% 不透明填充（SRCALPHA surface）
+        fill_surf = pygame.Surface((block_w, bh), pygame.SRCALPHA)
+        fill_surf.fill((r // 2, g // 2, b // 2, 178))
+        surface.blit(fill_surf, (bx, by))
+        # 白色描邊（100% 不透明）
+        pygame.draw.rect(surface, (255, 255, 255), (bx, by, block_w, bh), 2)
+
+
+def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None, history=None):
     font_title, font_scale, font_value, font_lr = fonts
 
     TITLE_H = 85
@@ -305,6 +345,13 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None)
     surface.blit(vs, (vx, vy))
     surface.set_clip(None)
 
+    # 歷史色塊：頂端對齊 -23 LUFS 標準線（ty），滿格頂到標準線
+    if history is not None and len(history) > 0:
+        hist_zone_h = BAR_Y + BAR_H - ty
+        draw_history_strip(surface, history,
+                           BAR_X + 4, ty + 4,
+                           BAR_W - 8, hist_zone_h - 8)
+
     # L/R — 標準線以下區域，垂直置中，白色，格式 "L -23"
     if lr_vals is not None:
         l_val, r_val = lr_vals
@@ -327,55 +374,83 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None)
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None):
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None):
     font_title, _, font_value, font_lr = fonts
 
-    TITLE_H  = 70
-    DELTA_H  = 110   # 底部保留給 delta 小字（只有 delta 不為 None 時使用）
-    MARGIN   = 10
+    TITLE_H        = 70
+    OUTLINE_OFFSET = 4
+    MARGIN         = 10
 
+    # ① 歷史色塊（最底層，覆蓋整個面板高度，SEGMENT 用）
+    if history is not None and len(history) > 0:
+        pygame.draw.rect(surface, (15, 15, 15), (px, py, pw, ph))
+        draw_history_strip(surface, history, px + 6, py + 6, pw - 12, ph - 12)
+
+    # 後續繪製都限制在面板範圍內
     surface.set_clip(pygame.Rect(px, py, pw, ph))
+
+    # ② Title（80% 不透明暗色背景，防止被歷史色塊蓋住）
+    bg_key = ('title_bg', pw, TITLE_H)
+    if bg_key not in surf_cache:
+        s = pygame.Surface((pw, TITLE_H), pygame.SRCALPHA)
+        s.fill((15, 15, 15, 204))   # 204 / 255 ≈ 80%
+        surf_cache[bg_key] = s
+    surface.blit(surf_cache[bg_key], (px, py))
+
     title_key = ('title', title)
     if title_key not in surf_cache:
         surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
     t = surf_cache[title_key]
-    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
-    surface.set_clip(None)
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 10))
 
-    num_h   = ph - TITLE_H - (DELTA_H if delta is not None else 0)
+    # ③ 大數字（垂直置中於 num zone）
+    num_h   = ph - TITLE_H
     val_str = _fmt_lufs(val)
     num_key = ('num_panel', val_str, pw, num_h)
     if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
-        sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=OUTLINE_OFFSET)
+        sc_val = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = pygame.transform.smoothscale(
-            vs_raw, (int(vs_raw.get_width() * sc), int(vs_raw.get_height() * sc)))
+            vs_raw, (int(vs_raw.get_width() * sc_val), int(vs_raw.get_height() * sc_val)))
     vs           = surf_cache[num_key]
     new_w, new_h = vs.get_size()
     vx           = px + pw // 2 - new_w // 2
     vy           = py + TITLE_H + num_h // 2 - new_h // 2
-    surface.set_clip(pygame.Rect(px, py, pw, ph))
     surface.blit(vs, (vx, vy))
-    surface.set_clip(None)
 
-    # Delta vs 上一區段（可選）
+    # ④ Delta（左下角，對齊大數字 "-" 中心，緊接數字底部）
     if delta is not None:
-        d_str   = (f"+{delta}" if delta > 0 else str(delta))
+        d_str   = str(delta)   # 正數不加 +，靠紅色區分
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
         d_key   = ('delta', d_str, d_color)
         if d_key not in surf_cache:
             surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=2)
-        ds   = surf_cache[d_key]
-        d_zone_y = py + TITLE_H + num_h
-        dy   = d_zone_y + (DELTA_H - ds.get_height()) // 2
-        surface.set_clip(pygame.Rect(px, d_zone_y, pw, DELTA_H))
-        surface.blit(ds, (px + pw // 2 - ds.get_width() // 2, dy))
-        surface.set_clip(None)
+        ds = surf_cache[d_key]
+
+        # 計算 sc 用於定位（font.size 比 font.render 輕量）
+        fw, fh = font_value.size(val_str)
+        sc = min((pw - MARGIN * 2) / (fw + OUTLINE_OFFSET * 2),
+                 (num_h - MARGIN * 2) / (fh + OUTLINE_OFFSET * 2))
+
+        # X：大數字 "-" 號中心
+        content_left = vx + int(OUTLINE_OFFSET * sc)
+        minus_w_sc   = int(font_value.size('-')[0] * sc)
+        delta_x      = content_left + minus_w_sc // 2
+
+        # Y：緊接數字底部，不超出面板底部
+        num_bottom     = vy + new_h
+        delta_half_h   = ds.get_height() // 2
+        delta_center_y = min(py + ph - delta_half_h - 6,
+                             num_bottom + delta_half_h + 4)
+
+        surface.blit(ds, (delta_x - ds.get_width() // 2, delta_center_y - delta_half_h))
+
+    surface.set_clip(None)
 
 
 def main():
-    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG
+    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history
 
     DEVICE = _setup_scarlett()
 
@@ -391,13 +466,23 @@ def main():
 
     font_title = pygame.font.SysFont("monospace", 70, bold=True)
     font_scale = pygame.font.SysFont("monospace", 32)
-    font_value = pygame.font.SysFont("monospace", 250, bold=True)
-    font_lr    = pygame.font.SysFont("monospace", 90, bold=True)
+
+    dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DSEG7Modern-Bold.ttf")
+    try:
+        font_value = pygame.font.Font(dseg_path, 250)
+        font_lr    = pygame.font.Font(dseg_path, 90)
+        print(f"DSEG7Modern loaded: {dseg_path}")
+    except (FileNotFoundError, pygame.error) as e:
+        print(f"DSEG7Modern not found ({e}), fallback to monospace")
+        font_value = pygame.font.SysFont("monospace", 250, bold=True)
+        font_lr    = pygame.font.SysFont("monospace", 90, bold=True)
+
     fonts = (font_title, font_scale, font_value, font_lr)
 
     surf_cache = {}   # surface cache: keyed by (type, content, ...) — rebuilt only on change
 
     seg_snapshot_time = time.time() + 180.0   # 3 分鐘後第一次快照
+    st_snapshot_time  = time.time() + 3.0     # 3 秒後第一次 SHORT TERM 快照
 
     pw = W // 3
 
@@ -430,10 +515,19 @@ def main():
                 reset_hour_flag = True
 
             now_t = time.time()
+            if now_t >= st_snapshot_time:
+                with lock:
+                    st_val = latest["S"]
+                if st_val > -70:
+                    st_history.append(st_val)
+                st_snapshot_time = now_t + 3.0
+
             if now_t >= seg_snapshot_time:
                 with lock:
                     seg_val = latest["SEG"]
-                prev_SEG = seg_val if seg_val > -70 else None   # 每 3 分鐘快照
+                if seg_val > -70:
+                    seg_history.append(seg_val)
+                    prev_SEG = seg_val
                 seg_snapshot_time = now_t + 180.0
 
             screen.fill((15, 15, 15))
@@ -441,19 +535,19 @@ def main():
             with lock:
                 vals = dict(latest)
 
-            for idx, (title, val, lr) in enumerate([
-                ("MOMENTARY",      vals["M"], (vals["M_L"], vals["M_R"])),
-                ('SHORT TERM (3")', vals["S"], None),
+            for idx, (title, val, lr, hist) in enumerate([
+                ("MOMENTARY",       vals["M"], (vals["M_L"], vals["M_R"]), None),
+                ('SHORT TERM (3")', vals["S"], None,                       st_history),
             ]):
-                draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr)
+                draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr, history=hist)
 
             # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
             half_h    = H // 2
-            h_delta   = round(vals["H"]   - prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
-            seg_delta = round(vals["SEG"] - prev_SEG) if prev_SEG is not None and vals["SEG"] > -70 else None
+            h_delta   = round(vals["H"]   - prev_H)       if prev_H   is not None and vals["H"]   > -70 else None
+            seg_delta = round(vals["SEG"] - seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
             draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta)
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta)
+            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history)
 
             for i in (1, 2):
                 pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
