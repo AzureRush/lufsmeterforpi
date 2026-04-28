@@ -63,7 +63,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 ## 顯示介面
 
-![螢幕截圖](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/preview.png)
+![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/loudness_meter_preview.gif)
 
 畫面分為三個垂直面板：
 
