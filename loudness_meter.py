@@ -457,12 +457,12 @@ def main():
     dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DSEG7Modern-Bold.ttf")
     try:
         font_value = pygame.font.Font(dseg_path, 250)
-        font_lr    = pygame.font.Font(dseg_path, 90)
+        font_lr    = pygame.font.Font(dseg_path, 140)
         print(f"DSEG7Modern loaded: {dseg_path}")
     except (FileNotFoundError, pygame.error) as e:
         print(f"DSEG7Modern not found ({e}), fallback to monospace")
         font_value = pygame.font.SysFont("monospace", 250, bold=True)
-        font_lr    = pygame.font.SysFont("monospace", 90, bold=True)
+        font_lr    = pygame.font.SysFont("monospace", 140, bold=True)
 
     fonts = (font_title, font_scale, font_value, font_lr)
 
