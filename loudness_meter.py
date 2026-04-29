@@ -264,8 +264,8 @@ def _y_ratio(val, lo=-60.0, hi=0.0):
         return _SPLIT_FRAC + (1.0 - _SPLIT_FRAC) * (val - _SPLIT_DB) / (hi - _SPLIT_DB)
 
 
-_HIST_LO  = -40.0   # 歷史色塊高度 0%
-_HIST_REF = TARGET_LUFS   # 歷史色塊高度 100%（-23 LUFS = 滿格）
+_HIST_LO  = -41.0   # 歷史色塊高度 0%
+_HIST_REF =   0.0   # 歷史色塊高度 100%（0 LUFS = 滿格）
 
 
 def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3):
