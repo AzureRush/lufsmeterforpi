@@ -25,7 +25,7 @@
 
 ## 訊號串接
 
-![訊號串接流程](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/signal_chain.drawio.png)
+![訊號串接流程](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/signal_chain.drawio.png)
 
 ---
 
@@ -62,7 +62,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 ## 顯示介面
 
-![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/loudness_meter_preview.gif)
+![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_meter_preview.gif)
 
 畫面分為三個垂直面板：
 

@@ -454,7 +454,7 @@ def main():
     font_title = pygame.font.SysFont("monospace", 70, bold=True)
     font_scale = pygame.font.SysFont("monospace", 32)
 
-    dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DSEG7Modern-Bold.ttf")
+    dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DSEG7Modern-Bold.ttf")
     try:
         font_value = pygame.font.Font(dseg_path, 250)
         font_lr    = pygame.font.Font(dseg_path, 140)
