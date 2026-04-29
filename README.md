@@ -68,15 +68,15 @@ Select device [1-2]: _
 
 ### MOMENTARY（瞬時）
 
-* 400ms 滑動窗口，即時反應當下音量
-* meter bar 顯示當前電平
-* 標準線以下區域顯示 **L / R 個別聲道電平**（格式：`L -26` / `R -26`）
+* 400ms 滑動窗口，即時反應當下響度
+* meter 色塊 顯示當前響度
+* 標準線以下區域顯示 **L / R 個別聲道響度值**（格式：`L -26` / `R -26`）
 
 ### SHORT TERM 3"（短期）
 
-* 3 秒滑動窗口，反應近期平均音量
-* meter bar 顯示當前電平
-* 標準線以下區域顯示 **20 格歷史色塊**：每 3 秒推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平；高度線性對應 LUFS 值（0 LUFS 時滿格、頂至標準線，−41 LUFS 時為空）
+* 3 秒滑動窗口，反應近期平均響度
+* meter 色塊 顯示近期平均響度
+* 標準線以下區域顯示 **20 格歷史色塊**：每 3 秒推入一筆，右對齊 FIFO（先進先出），色彩對應當時的 3 秒 K-weighted 均方響度（無 gating）；高度線性對應 LUFS 值（0 LUFS 時滿格、頂至標準線，−41 LUFS 時為空）
 
 ### THIS HOUR / SEGMENT（第三面板，僅顯示數字）
 
@@ -93,7 +93,7 @@ Select device [1-2]: _
 * 設計用途：新聞播出時近似監看單則新聞帶響度（稿頭 + 新聞帶 約 2'~3'）
 * 無須手動標記段落頭尾，滑動窗口隨時反映最近 3 分鐘的整體響度
 * 左下角顯示 **delta 指標**：與上一個 3 分鐘狀態快照的差值（紅色 = 比上一個 3 分鐘還高，綠色 = 比上一個 3 分鐘還低）
-* 底部顯示 **20 格歷史色塊**：每 3 分鐘推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平
+* 底部顯示 **20 格歷史色塊**：每 3 分鐘推入一筆，右對齊 FIFO（先進先出），色彩對應當時的 3 分鐘 gating 積分響度
 
 ### 顏色規則（MOMENTARY / SHORT TERM）
 
@@ -108,7 +108,7 @@ Select device [1-2]: _
 
 ---
 
-## 每小時紀錄
+## 自動輸出記錄檔
 
 程式會自動將每小時的 THIS HOUR 結果寫入：
 
@@ -203,3 +203,4 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 * https://github.com/csteinmetz1/pyloudnorm
 * [pyloudnorm: A simple yet flexible loudness meter in Python](https://csteinmetz1.github.io/pyloudnorm-eval/paper/pyloudnorm_preprint.pdf)
 * [ITU-R Algorithms to measure audio programme loudness and true-peak audio level](http://magnetic.beep.pl/Loudness/2016/R-REC-BS.1770-4-201510.pdf)
+* [DSEG Font](https://github.com/keshikan/DSEG)
