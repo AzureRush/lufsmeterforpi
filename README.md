@@ -76,7 +76,7 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 
 * 3 秒滑動窗口，反應近期平均音量
 * meter bar 顯示當前電平
-* 標準線以下區域顯示 **20 格歷史色塊**：每 3 秒推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平，高度以 −23 LUFS 標準線為滿格
+* 標準線以下區域顯示 **20 格歷史色塊**：每 3 秒推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平；高度線性對應 LUFS 值（0 LUFS 時滿格、頂至標準線，−41 LUFS 時為空）
 
 ### THIS HOUR / SEGMENT（第三面板，僅顯示數字）
 
@@ -143,10 +143,13 @@ cat ~/loudness_meter/loudness_log.csv
 
 ```
 音訊 callback（RT thread）
-  → K-weighting + 寫入 deque（每 50ms，CPU 占用 < 1%）
+  → H / SEG：有狀態 K-weighting，energy 直接寫入 deque
+              （濾波器狀態須跨 block 連續，只能在此執行）
+  → M / S  ：raw audio chunk 寫入 deque，交由 compute_loop 處理
 
 compute_loop（daemon thread，10Hz）
-  → 讀取 snapshot → K-weighted mean-square 計算 M/S → 自製 gating 計算 H 和 SEG
+  → M / S  ：對 raw audio 做無狀態 K-weighting → mean-square → LUFS
+  → H / SEG：對預算 energy 套用自製 EBU R128 two-stage gating
 
 pygame main thread（20fps）
   → 讀取 latest dict → 渲染畫面
@@ -176,9 +179,11 @@ pygame main thread（20fps）
 `loudness_meter.py` 頂部可調整：
 
 ```python
-SAMPLE_RATE = 48000
-BLOCK_SIZE  = 2400    # 50ms per block
-TARGET_LUFS = -23.0   # 目標線位置
+SAMPLE_RATE   = 48000
+BLOCK_SIZE    = 2400   # 50ms per block
+MOMENTARY_WIN = 0.4    # 瞬時窗口（秒）
+SHORTTERM_WIN = 3.0    # 短期窗口（秒）
+TARGET_LUFS   = -23.0  # 目標線位置（LUFS）
 ```
 
 Scarlett 裝置 index 由程式自動偵測，不需手動設定。
