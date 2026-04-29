@@ -2,7 +2,6 @@
 
 [![hackmd-github-sync-badge](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w/badge)](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w)
 
-
 用小型系統架構提供持續的響度(Loudness)監測方案，提供只有 Mixer 系統內建 Peak Meter 環境下以外的儀表，讓聲音控制更有參考性。
 
 本系統是在 Raspberry Pi 4B 上，以 python 為架構運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。
@@ -68,24 +67,33 @@ DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 畫面分為三個垂直面板：
 
 ### MOMENTARY（瞬時）
-- 400ms 滑動窗口，即時反應當下音量
-- meter bar 顯示當前電平
-- 底部顯示 **L / R 個別聲道電平**，方便監看立體聲平衡
+
+* 400ms 滑動窗口，即時反應當下音量
+* meter bar 顯示當前電平
+* 標準線以下區域顯示 **L / R 個別聲道電平**（格式：`L -26` / `R -26`）
 
 ### SHORT TERM 3"（短期）
-- 3 秒滑動窗口，反應近期平均音量
-- meter bar 顯示當前電平
+
+* 3 秒滑動窗口，反應近期平均音量
+* meter bar 顯示當前電平
+* 標準線以下區域顯示 **20 格歷史色塊**：每 3 秒推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平，高度以 −23 LUFS 標準線為滿格
 
 ### THIS HOUR / SEGMENT（第三面板，僅顯示數字）
 
 **THIS HOUR（上半）**
-- EBU R128 兩段 gating 積分響度，整點自動歸零
-- 靜音不影響數值（符合 EBU R128 規範，absolute gate 排除靜音）
+
+* EBU R128 兩段 gating 積分響度，整點自動歸零
+* 靜音不影響數值（符合 EBU R128 規範，absolute gate 排除靜音）
+* 標題括號內顯示當前小時（如 `THIS HOUR (9)`），整點自動更新
+* 左下角顯示 **delta 指標**：與上一個完整小時的差值（紅色 = 比上一個小時還高，綠色 = 比上一個小時還低）
 
 **SEGMENT 3'（下半）**
-- 3 分鐘滑動窗口的 gating 積分響度
-- 設計用途：新聞播出時近似監看單則新聞帶響度（live read + VT 約 2'~3'）
-- 無須手動標記段落頭尾，滑動窗口隨時反映最近 3 分鐘的整體響度
+
+* 3 分鐘滑動窗口的 gating 積分響度
+* 設計用途：新聞播出時近似監看單則新聞帶響度（稿頭 + 新聞帶 約 2'~3'）
+* 無須手動標記段落頭尾，滑動窗口隨時反映最近 3 分鐘的整體響度
+* 左下角顯示 **delta 指標**：與上一個 3 分鐘狀態快照的差值（紅色 = 比上一個 3 分鐘還高，綠色 = 比上一個 3 分鐘還低）
+* 底部顯示 **20 格歷史色塊**：每 3 分鐘推入一筆，右對齊 FIFO（先進先出），色彩對應當時電平
 
 ### 顏色規則（MOMENTARY / SHORT TERM）
 
@@ -117,9 +125,9 @@ date,hour,lufs
 2026-04-08,16,---
 ```
 
-- 整點觸發，寫入剛結束那個小時的最終積分響度
-- ESC 退出時也會寫入目前這個小時（未完成）的數值
-- `---` 代表該小時幾乎全為靜音（未通過 gating）
+* 整點觸發，寫入剛結束那個小時的最終積分響度
+* ESC 退出時也會寫入目前這個小時（未完成）的數值
+* `---` 代表該小時幾乎全為靜音（未通過 gating）
 
 查看紀錄：
 
@@ -179,14 +187,14 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
 ## 已知限制
 
-- 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
-- SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
-- KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
+* 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
+* SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
+* KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
 
 ---
 
 ## 參考(References)
-+ https://github.com/csteinmetz1/pyloudnorm
-+ [pyloudnorm: A simple yet flexible loudness meter in Python](https://csteinmetz1.github.io/pyloudnorm-eval/paper/pyloudnorm_preprint.pdf)
-+ [ITU-R Algorithms to measure audio programme
-loudness and true-peak audio level](http://magnetic.beep.pl/Loudness/2016/R-REC-BS.1770-4-201510.pdf)
+
+* https://github.com/csteinmetz1/pyloudnorm
+* [pyloudnorm: A simple yet flexible loudness meter in Python](https://csteinmetz1.github.io/pyloudnorm-eval/paper/pyloudnorm_preprint.pdf)
+* [ITU-R Algorithms to measure audio programme loudness and true-peak audio level](http://magnetic.beep.pl/Loudness/2016/R-REC-BS.1770-4-201510.pdf)
