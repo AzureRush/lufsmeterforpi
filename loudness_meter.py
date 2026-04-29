@@ -328,7 +328,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
     val_str    = _fmt_lufs(val)
     num_key    = ('num_bar', val_str, pw, num_zone_h)
     if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=4)
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=8)
         sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_zone_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = pygame.transform.smoothscale(
@@ -356,7 +356,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         for lr_str in (l_str, r_str):
             lr_key = ('lr', lr_str)
             if lr_key not in surf_cache:
-                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=2)
+                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=4)
         l_surf    = surf_cache[('lr', l_str)]
         r_surf    = surf_cache[('lr', r_str)]
         lr_zone_y = ty
@@ -374,7 +374,7 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     font_title, _, font_value, font_lr = fonts
 
     TITLE_H        = 70
-    OUTLINE_OFFSET = 4
+    OUTLINE_OFFSET = 8
     MARGIN         = 10
 
     if history is not None and len(history) > 0:
@@ -420,7 +420,7 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
         d_key   = ('delta', d_str, d_color)
         if d_key not in surf_cache:
-            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=2)
+            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=4)
         ds = surf_cache[d_key]
 
         content_left   = vx + int(OUTLINE_OFFSET * sc)
