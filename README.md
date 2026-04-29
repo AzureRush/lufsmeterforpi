@@ -8,7 +8,7 @@
 
 ---
 
-## 硬體需求
+## 系統軟硬體
 
 | 元件 | 規格 |
 |------|------|
@@ -23,7 +23,7 @@
 
 ---
 
-## 訊號串接
+## 系統訊號串接
 
 ![訊號串接流程](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/signal_chain.drawio.png)
 
@@ -72,7 +72,7 @@ Select device [1-2]: _
 * meter 色塊 顯示當前響度
 * 標準線以下區域顯示 **L / R 個別聲道響度值**（格式：`L -26` / `R -26`）
 
-### SHORT TERM 3"（短期）
+### SHORT TERM( 3")（短期）
 
 * 3 秒滑動窗口，反應近期平均響度
 * meter 色塊 顯示近期平均響度
@@ -80,14 +80,14 @@ Select device [1-2]: _
 
 ### THIS HOUR / SEGMENT（第三面板，僅顯示數字）
 
-**THIS HOUR（上半）**
+#### 上半區塊 : THIS HOUR（當下小時)
 
 * EBU R128 兩段 gating 積分響度，整點自動歸零
 * 靜音不影響數值（符合 EBU R128 規範，absolute gate 排除靜音）
 * 標題括號內顯示當前小時（如 `THIS HOUR (9)`），整點自動更新
 * 左下角顯示 **delta 指標**：與上一個完整小時的差值（紅色 = 比上一個小時還高，綠色 = 比上一個小時還低）
 
-**SEGMENT 3'（下半）**
+#### 下半區塊 : SEGMENT( 3')
 
 * 3 分鐘滑動窗口的 gating 積分響度
 * 設計用途：新聞播出時近似監看單則新聞帶響度（稿頭 + 新聞帶 約 2'~3'）
