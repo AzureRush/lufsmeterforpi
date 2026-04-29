@@ -35,6 +35,16 @@
 pip3 install sounddevice pygame scipy numpy
 ```
 
+---
+
+## 執行
+
+```bash
+DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
+```
+
+按 **ESC** 退出。
+
 程式啟動時會自動偵測 Focusrite Scarlett，無需手動設定 device index。
 若未偵測到 Scarlett，會列出所有可用輸入裝置並提示選擇：
 
@@ -47,16 +57,6 @@ Select device [1-2]: _
 ```
 
 輸入對應編號即可繼續執行，支援任何 ALSA 可識別的 USB 音訊介面。
-
----
-
-## 執行
-
-```bash
-DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
-```
-
-按 **ESC** 退出。
 
 ---
 
