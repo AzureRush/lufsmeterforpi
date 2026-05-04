@@ -41,11 +41,44 @@ pip3 install sounddevice pygame scipy numpy
 
 ## 執行
 
+依顯示環境選擇對應的啟動方式：
+
+**一般環境（有桌面 / Desktop OS）：**
 ```bash
 DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 ```
 
+**Headless + KMS（無桌面，預設 Pi OS Lite）：**
+```bash
+sudo SDL_VIDEODRIVER=kmsdrm python3 ~/loudness_meter/loudness_meter.py
+```
+
+**1080i + legacy fbdev（本專案目前硬體配置）：**
+
+需先建立 `/tmp/xorg.conf`，再透過 `xinit` 啟動（`sudo` 下 `~` 會指向 `/root`，請使用絕對路徑）：
+```bash
+cat > /tmp/xorg.conf << 'EOF'
+Section "Device"
+    Identifier "Card0"
+    Driver "fbdev"
+    Option "fbdev" "/dev/fb0"
+EndSection
+Section "Screen"
+    Identifier "Screen0"
+    Device "Card0"
+EndSection
+EOF
+
+sudo xinit /home/$USER/loudness_meter/venv/bin/python \
+  /home/$USER/loudness_meter/loudness_meter.py \
+  -- /usr/bin/X :0 vt7 -config /tmp/xorg.conf
+```
+
+> 1080i 模式需在 `/boot/firmware/config.txt` 設定 `hdmi_group=1`、`hdmi_mode=5`，並停用 `dtoverlay=vc4-kms-v3d`（KMS 不支援 interlaced）。
+
 按 **ESC** 退出。
+
+---
 
 程式啟動時會自動偵測 Focusrite Scarlett，無需手動設定 device index。
 若未偵測到 Scarlett，會列出所有可用輸入裝置並提示選擇：
