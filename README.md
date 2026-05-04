@@ -2,6 +2,8 @@
 
 [![hackmd-github-sync-badge](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w/badge)](https://hackmd.io/kbFwiQToSwiKuyRt7Xs71w)
 
+![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_meter_preview.gif)
+
 用小型系統架構提供持續的響度(Loudness)監測方案，提供只有 Mixer 系統內建 Peak Meter 環境下以外的儀表，讓聲音控制更有參考性。
 
 本系統是在 Raspberry Pi 4B 上，以 python 為架構運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。
@@ -62,7 +64,7 @@ Select device [1-2]: _
 
 ## 顯示介面
 
-![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_meter_preview.gif)
+![顯示介面說明](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/Loudness%20meter%20uiux.png)
 
 畫面分為三個垂直面板：
 
