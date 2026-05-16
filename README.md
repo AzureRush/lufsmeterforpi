@@ -181,7 +181,6 @@ pygame main thread（20fps）
   → 讀取 latest dict → 渲染畫面
 ```
 
-KMS + Wayland SDL driver 下由 GPU 硬體加速渲染，實測 Python 行程 CPU 約 **63%**（單核）、CPU 溫度約 **61°C**；舊版 fbdev 軟體渲染約 172–216%、80°C。
 
 ### 計算方法
 
