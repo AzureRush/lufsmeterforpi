@@ -21,7 +21,8 @@
 | 音訊介面 | Focusrite Scarlett 2i2 3rd Gen（USB Type-C → Type-A） |
 | 音源輸入 | Yamaha PM5D Monitor Out L / R（XLR 類比）→ Scarlett 2i2 |
 | 影像輸出 | Micro HDMI(Pi Out) → (optional)Datavideo DAC-9P（HDMI→SDI）→ (optional)KROMA LM6505 SDI 1 |
-| 解析度 | (optional)1080i 60Hz（legacy firmware 模式） 此為配合副控顯示系統 |
+| 顯示架構 | KMS（`vc4-kms-v3d`）+ Wayland（labwc）+ SDL2 Wayland driver |
+| 解析度 | 720p 60Hz（可透過 `wlr-randr` 調整，字型大小自動適應） |
 
 除了 Raspberry Pi 以外的設備應都可自行更換並適應。
 
@@ -50,33 +51,21 @@ pip3 install sounddevice pygame scipy numpy
 DISPLAY=:0 python3 ~/loudness_meter/loudness_meter.py
 ```
 
-**Headless + KMS（無桌面，預設 Pi OS Lite）：**
+**Pi OS Trixie + KMS/Wayland（本專案目前硬體配置）：**
+
+Pi OS Trixie 啟用 KMS（`/boot/firmware/config.txt` 加入 `dtoverlay=vc4-kms-v3d`）後，系統會自動啟動 labwc Wayland compositor。直接以 Wayland driver 啟動，無需 X11：
+
 ```bash
-sudo SDL_VIDEODRIVER=kmsdrm python3 ~/loudness_meter/loudness_meter.py
+# （選用）先確認解析度，視需要強制指定
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+  wlr-randr --output HDMI-A-1 --mode 1280x720@60
+
+# 啟動響度計
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 SDL_VIDEODRIVER=wayland \
+  ~/loudness_meter/venv/bin/python ~/loudness_meter/loudness_meter.py
 ```
 
-**1080i + legacy fbdev（本專案目前硬體配置）：**
-
-需先建立 `/tmp/xorg.conf`，再透過 `xinit` 啟動（`sudo` 下 `~` 會指向 `/root`，請使用絕對路徑）：
-```bash
-cat > /tmp/xorg.conf << 'EOF'
-Section "Device"
-    Identifier "Card0"
-    Driver "fbdev"
-    Option "fbdev" "/dev/fb0"
-EndSection
-Section "Screen"
-    Identifier "Screen0"
-    Device "Card0"
-EndSection
-EOF
-
-sudo xinit /home/$USER/loudness_meter/venv/bin/python \
-  /home/$USER/loudness_meter/loudness_meter.py \
-  -- /usr/bin/X :0 vt7 -config /tmp/xorg.conf
-```
-
-> 1080i 模式需在 `/boot/firmware/config.txt` 設定 `hdmi_group=1`、`hdmi_mode=5`，並停用 `dtoverlay=vc4-kms-v3d`（KMS 不支援 interlaced）。
+> 字型大小依偵測到的畫面寬度自動縮放（以 1920px 為基準），支援任意解析度。
 
 按 **ESC** 退出。
 
@@ -192,6 +181,8 @@ pygame main thread（20fps）
   → 讀取 latest dict → 渲染畫面
 ```
 
+KMS + Wayland SDL driver 下由 GPU 硬體加速渲染，實測 Python 行程 CPU 約 **63%**（單核）、CPU 溫度約 **61°C**；舊版 fbdev 軟體渲染約 172–216%、80°C。
+
 ### 計算方法
 
 | 指標 | 方法 | 窗口 |
@@ -229,9 +220,9 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
 ## 已知限制
 
-* 三個 panel 的 title 文字在 266px 寬度下會溢出，目前以 clip 截斷
 * SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
 * KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
+* Pi OS Trixie + KMS 環境下，解析度由 labwc Wayland compositor 依 EDID 自動協商，若需固定解析度須在每次開機後手動執行 `wlr-randr`（尚未設定開機自動套用）
 
 ---
 

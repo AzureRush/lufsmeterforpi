@@ -217,23 +217,30 @@ def _log_hour(dt, lufs_val):
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
-    """3 層渲染：黑色外框 → 同色描邊（加粗筆畫）→ 填充。"""
+    """3 層渲染：黑色外框（16 方向 × 雙半徑）→ 同色描邊 → 填充。"""
+    import math
     inner = max(1, offset // 2)
+    # 16 方向單位向量
+    dirs16 = [(math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)) for i in range(16)]
+    # 雙半徑：offset 與 offset×0.6（填補方向間的缺口）
+    radii  = [offset, max(1, round(offset * 0.6))]
 
     shadow_surf = font.render(text, True, outline_color)
-    color_surf  = font.render(text, True, color)   # stroke 和 fill 共用同一張
+    color_surf  = font.render(text, True, color)
 
     w = color_surf.get_width()  + offset * 2
     h = color_surf.get_height() + offset * 2
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
-    for dx, dy in [(-offset, 0), (offset, 0), (0, -offset), (0, offset),
-                   (-offset, -offset), (offset, -offset), (-offset, offset), (offset, offset)]:
-        surf.blit(shadow_surf, (dx + offset, dy + offset))
+    # 黑色外框（16 方向 × 雙半徑）
+    for r in radii:
+        for dx, dy in dirs16:
+            surf.blit(shadow_surf, (round(dx * r) + offset, round(dy * r) + offset))
 
-    for dx, dy in [(-inner, 0), (inner, 0), (0, -inner), (0, inner),
-                   (-inner, -inner), (inner, -inner), (-inner, inner), (inner, inner)]:
-        surf.blit(color_surf, (dx + offset, dy + offset))
+    # 同色內圈（8 方向，加粗筆畫感）
+    dirs8 = dirs16[::2]
+    for dx, dy in dirs8:
+        surf.blit(color_surf, (round(dx * inner) + offset, round(dy * inner) + offset))
 
     surf.blit(color_surf, (offset, offset))
     return surf
@@ -328,7 +335,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
     val_str    = _fmt_lufs(val)
     num_key    = ('num_bar', val_str, pw, num_zone_h)
     if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=8)
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=20)
         sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_zone_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = pygame.transform.smoothscale(
@@ -356,7 +363,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         for lr_str in (l_str, r_str):
             lr_key = ('lr', lr_str)
             if lr_key not in surf_cache:
-                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=4)
+                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=10)
         l_surf    = surf_cache[('lr', l_str)]
         r_surf    = surf_cache[('lr', r_str)]
         lr_zone_y = ty
@@ -374,7 +381,8 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     font_title, _, font_value, font_lr = fonts
 
     TITLE_H        = 70
-    OUTLINE_OFFSET = 8
+    _pscale        = pw / 640           # 640 = 1920//3，以此推算解析度比例
+    OUTLINE_OFFSET = max(4, round(20 * _pscale))
     MARGIN         = 10
 
     if history is not None and len(history) > 0:
@@ -420,7 +428,7 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
         d_key   = ('delta', d_str, d_color)
         if d_key not in surf_cache:
-            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=4)
+            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=10)
         ds = surf_cache[d_key]
 
         content_left   = vx + int(OUTLINE_OFFSET * sc)
@@ -451,18 +459,25 @@ def main():
     pygame.mouse.set_visible(False)
     clock  = pygame.time.Clock()
 
-    font_title = pygame.font.SysFont("monospace", 70, bold=True)
-    font_scale = pygame.font.SysFont("monospace", 32)
+    # 以 1920 為基準做比例縮放，適應任何解析度
+    _scale = W / 1920
+    _fs_value  = max(80,  round(250 * _scale))
+    _fs_lr     = max(50,  round(140 * _scale))
+    _fs_title  = max(24,  round(70  * _scale))
+    _fs_scale  = max(16,  round(32  * _scale))
+
+    font_title = pygame.font.SysFont("monospace", _fs_title, bold=True)
+    font_scale = pygame.font.SysFont("monospace", _fs_scale)
 
     dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DSEG7Modern-Bold.ttf")
     try:
-        font_value = pygame.font.Font(dseg_path, 250)
-        font_lr    = pygame.font.Font(dseg_path, 140)
+        font_value = pygame.font.Font(dseg_path, _fs_value)
+        font_lr    = pygame.font.Font(dseg_path, _fs_lr)
         print(f"DSEG7Modern loaded: {dseg_path}")
     except (FileNotFoundError, pygame.error) as e:
         print(f"DSEG7Modern not found ({e}), fallback to monospace")
-        font_value = pygame.font.SysFont("monospace", 250, bold=True)
-        font_lr    = pygame.font.SysFont("monospace", 140, bold=True)
+        font_value = pygame.font.SysFont("monospace", _fs_value, bold=True)
+        font_lr    = pygame.font.SysFont("monospace", _fs_lr, bold=True)
 
     fonts = (font_title, font_scale, font_value, font_lr)
 
@@ -530,8 +545,8 @@ def main():
 
             # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
             half_h    = H // 2
-            h_delta   = round(vals["H"]   - prev_H)       if prev_H   is not None and vals["H"]   > -70 else None
-            seg_delta = round(vals["SEG"] - seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
+            h_delta   = round(vals["H"]) - round(prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
+            seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
             draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta)
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
             draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history)
