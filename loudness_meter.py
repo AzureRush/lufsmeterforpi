@@ -217,13 +217,10 @@ def _log_hour(dt, lufs_val):
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
-    """3 層渲染：黑色外框（16 方向 × 雙半徑）→ 同色描邊 → 填充。"""
+    """2 層渲染：黑色外框（16 方向均勻擴展）→ 主色填充。
+    模擬 Photoshop 筆畫「外部」效果：白色主體大小不變，黑框只往外延伸。"""
     import math
-    inner = max(1, offset // 2)
-    # 16 方向單位向量
     dirs16 = [(math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)) for i in range(16)]
-    # 雙半徑：offset 與 offset×0.6（填補方向間的缺口）
-    radii  = [offset, max(1, round(offset * 0.6))]
 
     shadow_surf = font.render(text, True, outline_color)
     color_surf  = font.render(text, True, color)
@@ -232,16 +229,12 @@ def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
     h = color_surf.get_height() + offset * 2
     surf = pygame.Surface((w, h), pygame.SRCALPHA)
 
-    # 黑色外框（16 方向 × 雙半徑）
-    for r in radii:
+    # 第一層：黑色外框，16 方向往外擴展（雙半徑填補缺口）
+    for r in [offset, max(1, round(offset * 0.6))]:
         for dx, dy in dirs16:
             surf.blit(shadow_surf, (round(dx * r) + offset, round(dy * r) + offset))
 
-    # 同色內圈（8 方向，加粗筆畫感）
-    dirs8 = dirs16[::2]
-    for dx, dy in dirs8:
-        surf.blit(color_surf, (round(dx * inner) + offset, round(dy * inner) + offset))
-
+    # 第二層：白色主體，正中心疊上，大小不變
     surf.blit(color_surf, (offset, offset))
     return surf
 
@@ -335,7 +328,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
     val_str    = _fmt_lufs(val)
     num_key    = ('num_bar', val_str, pw, num_zone_h)
     if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=20)
+        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=34)
         sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_zone_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = pygame.transform.smoothscale(
@@ -363,7 +356,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         for lr_str in (l_str, r_str):
             lr_key = ('lr', lr_str)
             if lr_key not in surf_cache:
-                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=10)
+                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=17)
         l_surf    = surf_cache[('lr', l_str)]
         r_surf    = surf_cache[('lr', r_str)]
         lr_zone_y = ty
@@ -377,12 +370,12 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None):
-    font_title, _, font_value, font_lr = fonts
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below'):
+    font_title, _, font_value, font_lr, font_delta = fonts
 
     TITLE_H        = 70
     _pscale        = pw / 640           # 640 = 1920//3，以此推算解析度比例
-    OUTLINE_OFFSET = max(4, round(20 * _pscale))
+    OUTLINE_OFFSET = max(4, round(34 * _pscale))
     MARGIN         = 10
 
     if history is not None and len(history) > 0:
@@ -428,16 +421,23 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
         d_key   = ('delta', d_str, d_color)
         if d_key not in surf_cache:
-            surf_cache[d_key] = render_outlined(font_lr, d_str, d_color, offset=10)
+            surf_cache[d_key] = render_outlined(font_delta, d_str, d_color, offset=17)
         ds = surf_cache[d_key]
 
-        content_left   = vx + int(OUTLINE_OFFSET * sc)
-        minus_w_sc     = int(font_value.size('-')[0] * sc)
-        delta_x        = content_left + minus_w_sc // 2
-        num_bottom     = vy + new_h
-        delta_half_h   = ds.get_height() // 2
-        delta_center_y = min(py + ph - delta_half_h - 6,
-                             num_bottom + delta_half_h + 4)
+        delta_half_h = ds.get_height() // 2
+
+        if delta_align == 'side':
+            # 左側、面板頂端往下 32%（落在標題與大數字之間偏下）
+            delta_x        = px + MARGIN + ds.get_width() // 2
+            delta_center_y = py + round(ph * 0.32)
+        else:
+            # 大數字正下方（預設）
+            content_left   = vx + int(OUTLINE_OFFSET * sc)
+            minus_w_sc     = int(font_value.size('-')[0] * sc)
+            delta_x        = content_left + minus_w_sc // 2
+            num_bottom     = vy + new_h
+            delta_center_y = min(py + ph - delta_half_h - 6,
+                                 num_bottom + delta_half_h + 4)
 
         surface.blit(ds, (delta_x - ds.get_width() // 2, delta_center_y - delta_half_h))
 
@@ -463,6 +463,7 @@ def main():
     _scale = W / 1920
     _fs_value  = max(80,  round(250 * _scale))
     _fs_lr     = max(50,  round(140 * _scale))
+    _fs_delta  = max(32,  round(100 * _scale))   # delta 獨立字型，比 L/R 略小
     _fs_title  = max(24,  round(70  * _scale))
     _fs_scale  = max(16,  round(32  * _scale))
 
@@ -473,13 +474,15 @@ def main():
     try:
         font_value = pygame.font.Font(dseg_path, _fs_value)
         font_lr    = pygame.font.Font(dseg_path, _fs_lr)
+        font_delta = pygame.font.Font(dseg_path, _fs_delta)
         print(f"DSEG7Modern loaded: {dseg_path}")
     except (FileNotFoundError, pygame.error) as e:
         print(f"DSEG7Modern not found ({e}), fallback to monospace")
         font_value = pygame.font.SysFont("monospace", _fs_value, bold=True)
         font_lr    = pygame.font.SysFont("monospace", _fs_lr, bold=True)
+        font_delta = pygame.font.SysFont("monospace", _fs_delta, bold=True)
 
-    fonts = (font_title, font_scale, font_value, font_lr)
+    fonts = (font_title, font_scale, font_value, font_lr, font_delta)
 
     surf_cache = {}   # surface cache: keyed by (type, content, ...) — rebuilt only on change
 
@@ -549,7 +552,7 @@ def main():
             seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
             draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta)
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history)
+            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history, delta_align='side')
 
             for i in (1, 2):
                 pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
