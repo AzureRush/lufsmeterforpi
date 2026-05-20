@@ -370,7 +370,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below'):
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below', num_color=(255, 255, 255)):
     font_title, _, font_value, font_lr, font_delta = fonts
 
     TITLE_H        = 70
@@ -400,9 +400,9 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
 
     num_h   = ph - TITLE_H
     val_str = _fmt_lufs(val)
-    num_key = ('num_panel', val_str, pw, num_h)
+    num_key = ('num_panel', val_str, pw, num_h, num_color)
     if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=OUTLINE_OFFSET)
+        vs_raw = render_outlined(font_value, val_str, num_color, offset=OUTLINE_OFFSET)
         sc_val = min((pw - MARGIN * 2) / vs_raw.get_width(),
                      (num_h - MARGIN * 2) / vs_raw.get_height())
         surf_cache[num_key] = (
@@ -550,7 +550,7 @@ def main():
             half_h    = H // 2
             h_delta   = round(vals["H"]) - round(prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
             seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
-            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta)
+            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta, num_color=lufs_to_color(vals["H"]))
             pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
             draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history, delta_align='side')
 
