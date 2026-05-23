@@ -289,7 +289,7 @@ def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3
 
 
 def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None, history=None):
-    font_title, font_scale, font_value, font_lr = fonts
+    font_title, font_scale, font_value, font_lr, *_ = fonts
 
     TITLE_H = 85
     PAD     = 6
