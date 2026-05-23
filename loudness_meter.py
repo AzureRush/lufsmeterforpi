@@ -426,15 +426,13 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
 
         delta_half_h = ds.get_height() // 2
 
+        content_left = vx + int(OUTLINE_OFFSET * sc)
+        minus_w_sc   = int(font_value.size('-')[0] * sc)
+        delta_x      = content_left + minus_w_sc // 2
+
         if delta_align == 'side':
-            # 左側、面板頂端往下 32%（落在標題與大數字之間偏下）
-            delta_x        = px + MARGIN + ds.get_width() // 2
             delta_center_y = py + round(ph * 0.32)
         else:
-            # 大數字正下方（預設）
-            content_left   = vx + int(OUTLINE_OFFSET * sc)
-            minus_w_sc     = int(font_value.size('-')[0] * sc)
-            delta_x        = content_left + minus_w_sc // 2
             num_bottom     = vy + new_h
             delta_center_y = min(py + ph - delta_half_h - 6,
                                  num_bottom + delta_half_h + 4)
