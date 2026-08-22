@@ -703,8 +703,11 @@ def main():
 
     # 錄影/遠端除錯用：不用碰實體按鍵，SSH 執行 `kill -USR1 <PID>`／`kill -USR2 <PID>`
     # 就能觸發下一個/上一個頻率，直接呼叫跟按鍵回呼相同的 _step_freq()。
+    # SIGUSR1/SIGUSR2 都用掉了，畫面切換借用 SIGHUP（`kill -HUP <PID>`）——這支程式
+    # 不依賴終端機、沒有需要處理「真正 hangup」的情境，借用完全安全。
     signal.signal(signal.SIGUSR1, lambda sig, frame: _step_freq(1))
     signal.signal(signal.SIGUSR2, lambda sig, frame: _step_freq(-1))
+    signal.signal(signal.SIGHUP, lambda sig, frame: _toggle_display_mode())
 
     # 單工輸入 stream——耳機監聽改回 Scarlett 硬體 Direct Monitor（零延遲），
     # Pi 只做分析／顯示，不輸出任何音訊。

@@ -8,6 +8,8 @@
 
 這個功能目前保留在程式碼裡（不是錄完就刪），因為之後任何需要遠端展示/除錯頻率步進的場合都用得到，成本很低（4 行）。如果之後確定用不到，可以直接刪除。
 
+**後續補充（2026-08-15）**：SIGUSR1/SIGUSR2 都拿去做頻率步進了，畫面切換（`_toggle_display_mode()`）另外借用 `SIGHUP`（`kill -HUP <PID>`）觸發。這支程式不是互動式終端機程式、不依賴收到真正 hangup 訊號做任何事，借用完全安全。三個訊號涵蓋了全部三顆 GPI 按鍵的等效遠端觸發（畫面切換／上一個/下一個頻率），之後展示或除錯都不用碰實體按鍵。
+
 **踩到的坑（SSH 相關，跟先前 `pkill -f loudness_meter.py` 自我匹配是同一類問題）**：在同一段 SSH 遠端 script 裡用 `PID=$(pgrep -f loudness_meter.py)` 抓 PID，結果連線直接斷掉（exit 255、無輸出）——因為 `pgrep -f` 連執行這段 script 的 shell 自己都算進比對範圍（該 shell 的完整指令字串裡也含有 `loudness_meter.py`），抓到的 PID 混進了 shell 自己的 PID。`kill -USR1 $PID` 送到 shell 自己身上時，因為 shell 對 `SIGUSR1` 沒有自訂處理、預設動作是終止行程，就把整段 SSH session 砍斷了。**教訓**：在 SSH 遠端 script 裡若要對 `loudness_meter.py` 這個行程送訊號，一律用「先前一次獨立的 SSH 呼叫」查好的 PID 當常數帶進去，不要在同一段會被 `pgrep -f` 掃到自己的 script 裡現查。
 
 ## 2026-08-15：GPIO 上一個/下一個頻率腳位第二次對調
@@ -89,3 +91,13 @@ F.F.dBFS 三個頻率都準確讀到 −20（跟 PM5D 送出的電平一致）�
 修改 README.md 的 Spectrum Analyzer 說明時，發現原本設定好的 GIF 連結（`assets/spectrum_analyzer_preview.gif`）已經被換成一個完全不相關的網址（`https://raw.githubusercontent.com/AzureRush/audiorookie/main/1786806821000r9bq2f.gif`，指向使用者另一個 repo、檔名像是某個貼圖工具自動產生的隨機檔名）。比對 `README.md.backup`（同目錄下一個未知來源的舊檔）發現同一段內容也是這個網址，研判是這個問題的線索，但確切原因不明。
 
 本專案開發機在 Google 雲端硬碟同步資料夾裡（`G:\我的雲端硬碟\...`），這類非預期的檔案內容變化，過去在其他專案（x-broadcast）也發生過，懷疑跟雲端同步的版本衝突處理有關。**已修正回正確連結**，但這批被覆蓋的內容已經進了 `9299ece` 那次 commit——commit 本身沒有問題（內容仍是合法的 markdown），只是记錄了這個暫時性的錯誤狀態。若之後還發生類似情況，建議檢查 Google 雲端硬碟該檔案的版本歷史，確認是不是同步衝突造成的。
+
+## 2026-08-15：SIGHUP 補上畫面切換的遠端觸發，Stage 4/5 上機驗證通過
+
+SIGUSR1/SIGUSR2 已經用在頻率步進，畫面切換（`_toggle_display_mode()`）另外借用 `SIGHUP`（[loudness_meter.py:709](loudness_meter.py:709)，`kill -HUP <PID>`）——原因跟安全性見上面「SIGUSR1/SIGUSR2」那節的補充。部署後實測：`kill -HUP <PID>` 成功把畫面從 Loudness 切到 Spectrum（screenshot 確認），三顆 GPI 按鍵現在都有對應的遠端訊號觸發，之後展示/除錯不用再麻煩使用者碰實體按鍵。
+
+Stage 4（移除音訊監聽輸出）＋ Stage 5（BAND dBFS 改用 peak hold、三格改名）上機驗證結果：
+- `sd.InputStream` 開啟正常（無 PortAudioError），CPU 65-73%、溫度 55-56°C，跟基準同量級
+- Spectrum 畫面截圖確認：ALL LUFS／BAND dBFS／BAND FREQ 三個新名稱正確顯示，Peak hold 白線正常
+- 使用者實機戴耳機確認：Scarlett Direct Monitor 重新開啟後監聽零延遲、無回音感，Stage 4 回退達成原本目的
+- Git：`9299ece`（Stage 3 完整版）→ `1f86263`（Stage 4/5 回退＋改名）→ `b696f52`（README 預覽 GIF 更新為回退後畫面，內容用 SIGUSR1 遠端步進＋`grim`連續截圖＋`ffmpeg`兩階段調色盤合成，做法已存成全域記憶 `feedback_remote_device_demo_gif.md`，供其他專案重複使用）
