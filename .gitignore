@@ -1,0 +1,7 @@
+# 本機開發／部署用，含內網 IP 與 SSH 使用者名稱，不進版控
+CLAUDE.md
+set-pi-ip.bat
+
+# Python
+__pycache__/
+*.pyc
