@@ -8,7 +8,7 @@
 
 用小型系統架構提供持續的響度(Loudness)監測方案，提供只有 Mixer 系統內建 Peak Meter 環境下以外的儀表，讓聲音控制更有參考性。
 
-本系統是在 Raspberry Pi 4B 上，以 python 為架構運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。
+本系統是在 Raspberry Pi 4B 上，以 python 為架構運行的即時 LUFS 監看工具，符合 EBU R128 / ITU-R BS.1770-4 廣播標準。另備有 **Spectrum Analyzer**（1/3 Octave 即時頻譜）作為第二畫面，可用外部設備的 GPI 訊號直接切換，不需鍵盤滑鼠。
 
 ---
 
@@ -110,11 +110,43 @@ Select device [1-2]: _
 
 ---
 
-## 顯示介面
+## 操作（GPI 控制）
+
+本系統有**兩個畫面**，用外部設備（本專案為 Yamaha PM5D）透過 GPI OUT 送觸發訊號到 Pi 的 GPIO 切換，不需要額外接鍵盤滑鼠或觸控螢幕：
+
+| 畫面 | 內容 |
+|------|------|
+| 畫面一：Loudness Meter | EBU R128 響度監看（M / S / THIS HOUR / SEGMENT） |
+| 畫面二：Spectrum Analyzer | 1/3 Octave 即時頻譜 |
+
+三個 GPI 訊號（UNLATCH 瞬時脈衝、Low Active）：
+
+| 功能 | 行為 | 生效畫面 |
+|------|------|----------|
+| 畫面切換 | 兩個畫面來回切換 | 兩個畫面皆可 |
+| 上一個 / 下一個頻率 | 移動 Spectrum 畫面上反白的頻段與左側讀值 | **僅 Spectrum 畫面**——在 Loudness 畫面按下會被忽略，避免誤觸改動狀態 |
+
+> **切換畫面不會中斷背景運算**：響度計算執行緒持續在跑，THIS HOUR / SEGMENT / 歷史色塊都照常累積，切回 Loudness 畫面時數據不會斷一截。
+
+### 遠端觸發（不用碰實體按鍵）
+
+程式另外註冊了三個對應的系統訊號，SSH 連上後可直接觸發，方便遠端展示、錄製畫面或除錯：
+
+```bash
+kill -HUP  <PID>   # 畫面切換
+kill -USR1 <PID>   # 下一個頻率
+kill -USR2 <PID>   # 上一個頻率
+```
+
+`<PID>` 用 `pgrep -f loudness_meter.py` 查。**注意**：不要在同一段 SSH 指令裡用 `pgrep -f` 現查再送訊號——執行該指令的 shell 自己也含有同樣字串、會被一起比對到，訊號會誤送給自己的 SSH session 導致連線中斷。PID 請用前一次獨立的指令查好再帶入。
+
+---
+
+## 畫面一：Loudness Meter（響度計）
 
 ![顯示介面說明](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/Loudness%20meter%20uiux.png)
 
-畫面分為三個垂直面板：
+平常監看用的主畫面，分為三個垂直面板：
 
 ### MOMENTARY（瞬時）
 
@@ -158,9 +190,7 @@ Select device [1-2]: _
 
 ---
 
-## Spectrum Analyzer（第二畫面）
-
-用外部設備（本專案為 Yamaha PM5D）透過 GPI OUT 送觸發訊號到 Pi 的 GPIO，在 Loudness Meter 和 Spectrum Analyzer 之間切換，不需要額外接鍵盤滑鼠或觸控螢幕。
+## 畫面二：Spectrum Analyzer（頻譜分析儀）
 
 ![Spectrum Analyzer 預覽](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/spectrum_analyzer_preview.gif)
 
@@ -168,18 +198,12 @@ Select device [1-2]: _
 
 即時 1/3 Octave 頻譜視覺化，用來找特別刺耳或想消除的頻率。Pi 純粹是視覺診斷工具、不輸出任何音訊——實際掃頻監聽交給混音台自己的 EQ 搭配耳機/喇叭聽，找到問題頻段後也是在混音台上做 EQ 修正，不在 Pi 上處理。
 
-（曾經做過 Pi 端步進式帶通濾波器＋耳機監聽輸出，但實機測試時耳機聽到的是「Pi 處理過、有延遲的訊號」疊加「房間裡即時的 main out 喇叭聲」，~100ms 的來回延遲造成明顯回音感，反而比對找頻率更干擾，因此改回讓耳機監聽走 Scarlett 硬體 Direct Monitor（零延遲，不經過 Pi）。這部分程式碼保留在 git 歷史裡，之後如果有更好的低延遲方案可以回頭套用。）
+### 頻段選擇
 
-### 操作
+用 GPI 的「上一個 / 下一個頻率」移動反白的頻段，左側 BAND dBFS / BAND FREQ 讀值跟著更新。**這只是顯示狀態，不影響任何音訊。**
 
-三個 GPI 訊號（UNLATCH 瞬時脈衝）：
-
-| 功能 | 行為 |
-|------|------|
-| 畫面切換 | Loudness Meter ↔ Spectrum Analyzer 來回切換 |
-| 上一個/下一個頻率 | 移動畫面上反白的頻段與左側讀值，繞邊界會 wraparound（連續按同一顆也能到達所有頻率），純顯示用途、不影響任何音訊 |
-
-頻率清單最後多一格 `ALL`，代表「不選定特定頻段」的畫面狀態（BAND dBFS 顯示 `---`、長條圖不反白任何一條）。
+* 走到清單邊界會 **wraparound** 繞到另一頭——萬一其中一顆鍵故障，另一顆單獨連續按繞一圈仍能到達所有頻段，不會有走不到的死角
+* 頻率清單最後多一格 `ALL`，代表「不選定特定頻段」（BAND dBFS 顯示 `---`、長條圖不反白任何一條）
 
 ### 畫面配置
 
@@ -197,24 +221,35 @@ Select device [1-2]: _
 
 ## 技術架構
 
-採用三執行緒設計，避免音訊 callback 過載：
+音訊為**單工輸入**（`sd.InputStream`），程式不輸出任何音訊。核心是三條執行緒分工，讓音訊 callback 維持輕量、不過載：
 
 ```
-音訊 callback（RT thread）
+音訊 callback（PortAudio RT thread，每 50ms 一個 block）
   → H / SEG：有狀態 K-weighting，energy 直接寫入 deque
               （濾波器狀態須跨 block 連續，只能在此執行）
   → M / S  ：raw audio chunk 寫入 deque，交由 compute_loop 處理
 
-compute_loop（daemon thread，10Hz）
+compute_loop（daemon thread，10Hz）— 兩個畫面下都持續運行
   → M / S  ：對 raw audio 做無狀態 K-weighting → mean-square → LUFS
-  → H / SEG：對預算 energy 套用自製 EBU R128 two-stage gating
+  → H / SEG：對預存 energy 套用自製 EBU R128 two-stage gating
 
 pygame main thread（20fps）
-  → 讀取 latest dict → 渲染畫面
+  → Loudness 畫面：讀取 latest dict → 渲染三面板
+  → Spectrum 畫面：對 buf_s_chunks 尾端取樣做 FFT → 分頻段 → 渲染長條圖
+                   （毫秒級運算，直接內嵌在 frame 預算內，不另開執行緒）
 ```
 
+**GPIO 按鍵**由 `gpiozero` 自行管理監聽執行緒（`when_pressed` 回呼），**系統訊號**（SIGHUP / SIGUSR1 / SIGUSR2）則在主執行緒執行。兩者都只改動全域狀態變數（`display_mode`、`freq_index`）——單一參考重新賦值在 CPython 是原子操作，不需要額外上鎖。
+
+幾個刻意的設計取捨：
+
+* **Spectrum 不開背景執行緒**：LUFS 需要背景執行緒是因為它得在你看別的畫面時持續累積整小時的數據；頻譜圖沒有這個需求，只有正在看這個畫面時才需要算，因此直接在 frame 內算完就畫，省下一條執行緒、一份共享字典與一次上鎖
+* **Spectrum 重用既有音訊緩衝**：直接取 `buf_s_chunks`（原本給 S 用的 3 秒緩衝）尾端 8192 samples，不另外開緩衝、也完全不動音訊 callback
+* **渲染快取**：文字與數字 surface 以「內容」為 key 快取（`surf_cache`），值沒變就跳過昂貴的描邊渲染與縮放，只留一次 blit。兩個畫面共用同一套機制
 
 ### 計算方法
+
+**響度（Loudness Meter）**
 
 | 指標 | 方法 | 窗口 |
 |------|------|------|
@@ -224,12 +259,28 @@ pygame main thread（20fps）
 | SEG | 同 H | 3 分鐘滑動 |
 | L/R | K-weighted mean-square per channel | 400ms 滑動 |
 
-### 音量刻度（非線性）
+**頻譜（Spectrum Analyzer）**
+
+| 項目 | 方法 |
+|------|------|
+| FFT | 8192 samples（~171ms @ 48kHz，解析度 ~5.9Hz）＋ Hann window |
+| 聲道合併 | 左右聲道**各自**做 FFT 算功率後取平均——不可先在時域平均兩聲道再做 FFT，兩聲道相位不一致時會互相抵消（實測曾造成 ~30dB 誤差） |
+| 頻段能量 | 頻段內 bin **加總**（非平均），符合 RTA 慣例；平均會把窄頻測試音的能量稀釋到頻段內的空 bin 裡 |
+| dBFS 校準 | 以 Parseval 能量守恆推導校準基準（`N × Σwindow² / 4`），滿刻度正弦波準確讀出 0dBFS；已用合成訊號驗證誤差 <0.01dB |
+| Peak hold | 碰到新高點立即跟上並頂住 1 秒，之後以 12dB/秒回落；BAND dBFS 讀值直接沿用此值 |
+
+### 顯示刻度（非線性）
+
+兩個畫面各自有一條刻度曲線，把畫面高度集中配置在訊號實際常駐的區間：
 
 ```
-−60 ~ −40 LUFS → 下方 20% 空間
-−40 ~   0 LUFS → 上方 80% 空間
+Loudness Meter（LUFS）        Spectrum Analyzer（dBFS）
+−60 ~ −40 → 下方 20% 空間      −70 ~ −40 → 下方 15% 空間
+−40 ~   0 → 上方 80% 空間      −40 ~ −20 → 中段 70% 空間 ← 訊號常駐區
+                               −20 ~   0 → 上方 15% 空間
 ```
+
+Spectrum 的 Y 軸刻度線與長條高度使用同一條曲線計算，所以刻度間距本身就是非等距的。
 
 ---
 
@@ -238,12 +289,28 @@ pygame main thread（20fps）
 `loudness_meter.py` 頂部可調整：
 
 ```python
-SAMPLE_RATE   = 48000
-BLOCK_SIZE    = 2400   # 50ms per block
-MOMENTARY_WIN = 0.4    # 瞬時窗口（秒）
-SHORTTERM_WIN = 3.0    # 短期窗口（秒）
-TARGET_LUFS   = -23.0  # 目標線位置（LUFS）
+# ── 音訊 / 響度 ──
+SAMPLE_RATE = 48000
+BLOCK_SIZE  = 2400     # 50ms per block
+M_BLOCKS    = 8        # 瞬時窗口 = 8 × 50ms = 400ms
+S_BLOCKS    = 60       # 短期窗口 = 60 × 50ms = 3s
+TARGET_LUFS = -23.0    # 目標線位置（LUFS）
+FPS         = 20       # 畫面更新率
+
+# ── GPIO 腳位（BCM 編號）──
+GPIO_PIN_TOGGLE    = 17   # 實體 Pin 11，畫面切換
+GPIO_PIN_FREQ_PREV = 27   # 實體 Pin 13，上一個頻率
+GPIO_PIN_FREQ_NEXT = 22   # 實體 Pin 15，下一個頻率
+
+# ── Spectrum Analyzer ──
+SPECTRUM_FFT_SIZE     = 8192    # FFT 視窗大小
+_PEAK_HOLD_SEC        = 1.0     # peak 頂住不落下的時間（秒）
+_PEAK_DECAY_PER_SEC   = 12.0    # 頂住時間過後的回落速度（dB/秒）
+_SPECTRUM_DBFS_LO     = -70.0   # 長條圖底部
+_SPECTRUM_DBFS_HI     = 0.0     # 長條圖頂部（0dBFS = 數位滿刻度）
 ```
+
+> ⚠️ 同一區塊還有兩個歷史遺留常數 `MOMENTARY_WIN` / `SHORTTERM_WIN`，**程式中並未使用**，改動它們不會有任何效果。實際窗口長度請改 `M_BLOCKS` / `S_BLOCKS`。
 
 Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
@@ -252,6 +319,8 @@ Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 ## 已知限制
 
 * SEGMENT 為近似段落監看，無法精確對齊新聞帶頭尾
+* **Pi 不輸出任何音訊**：耳機監聽需靠音訊介面本身的 Direct Monitor（或混音台送出）。曾實作過 Pi 端帶通濾波器＋耳機監聽輸出，但 USB 來回約 100ms 的延遲疊加現場 main out 喇叭會產生明顯回音感，實測不堪用而移除（程式碼保留在 git 歷史中，日後若有低延遲方案可回頭套用）
+* Spectrum Analyzer 依賴外部設備的 GPI 訊號操作，沒有鍵盤/觸控的備援介面；遠端可用系統訊號觸發（見「操作」章節）
 * KROMA LM6505 有點毛病，單一 Monitor 雖有 SDI1/2 但若頻率無對齊就會出現握手問題，若發生無法握手則拔掉無法對齊的訊源並重開 KROMA LM6505。
 * Pi OS Trixie + KMS 環境下，解析度由 labwc Wayland compositor 依 EDID 自動協商，若需固定解析度須在每次開機後手動執行 `wlr-randr`（尚未設定開機自動套用）
 
