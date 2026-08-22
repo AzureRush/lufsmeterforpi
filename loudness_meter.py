@@ -9,7 +9,7 @@ import datetime
 import time
 import os
 import signal
-from scipy.signal import lfilter, butter, sosfilt
+from scipy.signal import lfilter
 from gpiozero import Button
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -74,8 +74,6 @@ S_BLOCKS = 60   # blocks needed for S window
 GPIO_PIN_TOGGLE    = 17   # 實體 Pin 11，畫面切換（PM5D Pin2/GPO3/KEY9）
 GPIO_PIN_FREQ_PREV = 27   # 實體 Pin 13，上一個頻率（PM5D Pin3/GPO5/KEY10）
 GPIO_PIN_FREQ_NEXT = 22   # 實體 Pin 15，下一個頻率（PM5D Pin13/GPO12/KEY11）
-
-BANDPASS_Q = 8.0   # 掃頻濾波器 Q 值（頻寬窄/寬），上機用耳朵調——沒有「正確答案」
 
 # ─── Spectrum Analyzer（1/3 Octave 頻譜顯示，IEC 61260 標準頻率） ─────────────
 SPECTRUM_FFT_SIZE  = 8192   # ~171ms @ 48kHz，頻率解析度 ~5.9Hz
@@ -163,15 +161,11 @@ reset_hour_flag = False
 _running        = True
 
 display_mode = "loudness"   # "loudness" / "spectrum" — GPIO 畫面切換鈕控制
-freq_index   = 0            # 帶通濾波器目前步進位置
+freq_index   = 0            # 目前選定/反白的頻段索引，純顯示用（BAND dBFS／BAND FREQ）
 
 # Peak hold：每個頻段一格，只在原地用索引更新內容，不重新賦值整個 list，不用 global。
 _spectrum_peaks     = [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
 _spectrum_peak_hold = [0] * len(OCTAVE_BANDS)   # 每個頻段「還要再頂住幾幀」的倒數計時
-
-# 目前的帶通濾波器係數＋逐聲道 zi 狀態。按鈕回呼直接整包換一個新 dict 參考給 audio
-# callback 讀，不用上鎖——單一參考重新賦值在 CPython 是原子操作，比照 reset_hour_flag。
-current_filter = None
 
 prev_H   = None   # last completed hour's LUFS（整點 rollover 時更新）
 prev_SEG = None   # last 3-min fixed segment's LUFS（每 3 分鐘快照）
@@ -218,27 +212,10 @@ def compute_h(block_energies):
     return _energy_to_lufs(np.mean(power[m2]))
 
 
-def design_bandpass_filter(f_center, q):
-    """窄頻帶通濾波器係數，SOS 格式（比現有 K-weighting 用的 b/a 格式數值穩定，
-    窄頻濾波器用 b/a 容易不穩定，SOS 是業界標準解法，不要簡化回 b/a）。
-    Q 值決定頻寬窄/寬，上機用耳朵調，沒有「正確答案」。"""
-    bandwidth = f_center / q
-    f_lo = max(20.0, f_center - bandwidth / 2)
-    f_hi = min(SAMPLE_RATE / 2 - 100, f_center + bandwidth / 2)
-    return butter(4, [f_lo, f_hi], btype='bandpass', fs=SAMPLE_RATE, output='sos')
-
-
-def _new_filter_state(f_center, q):
-    """設計濾波器＋建立歸零的 zi 狀態，回傳可以整包原子替換的 dict。"""
-    sos = design_bandpass_filter(f_center, q)
-    zi  = [np.zeros((sos.shape[0], 2)) for _ in range(CHANNELS)]
-    return {"sos": sos, "zi": zi}
-
-
-def audio_callback(indata, outdata, frames, time_info, status):
-    """Lightweight: K-weight + 3 deque appends + 輸出路由。~2ms per call 預算。
-    雙工 stream：同時收音訊（indata）跟送音訊（outdata），比分開開兩條 stream
-    保證兩者是同一個時間點對齊的，掃頻監聽的即時性才有意義。"""
+def audio_callback(indata, frames, time_info, status):
+    """Lightweight: K-weight + 3 deque appends. ~2ms per call 預算。
+    單工 input-only stream——Spectrum 模式的耳機監聽改回 Scarlett 硬體 Direct
+    Monitor（零延遲），Pi 完全不輸出音訊，純粹是視覺化診斷工具。"""
     global _zi_pre, _zi_rlb, reset_hour_flag
 
     if status:
@@ -257,17 +234,6 @@ def audio_callback(indata, outdata, frames, time_info, status):
     buf_s_chunks.append(audio)
     hour_block_energies.append(energies)
     segment_block_energies.append(energies)
-
-    # 輸出路由：Loudness 模式直通（怎麼進怎麼出），Spectrum 模式送濾波後訊號
-    if display_mode == "spectrum" and current_filter is not None:
-        sos = current_filter["sos"]
-        zi  = current_filter["zi"]
-        filtered = np.empty_like(audio)
-        for ch in range(CHANNELS):
-            filtered[:, ch], zi[ch] = sosfilt(sos, audio[:, ch], zi=zi[ch])
-        outdata[:] = filtered
-    else:
-        outdata[:] = indata
 
 
 def compute_loop():
@@ -587,23 +553,6 @@ def compute_spectrum_bands():
     return levels_dbfs
 
 
-_freq_dbfs_smoothed     = None
-_freq_dbfs_smoothed_idx = None
-
-
-def _smoothed_freq_dbfs(raw_dbfs, idx, alpha=0.15):
-    """F.F.dBFS 數字讀值用 EMA 平滑——真實音訊逐幀跳動很大，數字直接顯示會快到看不清楚。
-    長條圖本身不套這個（維持即時反應），只有這個數字讀值需要穩定好讀。
-    切換到不同頻段時（idx 變了）立刻重置成新頻段當下值，不會有從舊頻段慢慢爬過去的違和感。"""
-    global _freq_dbfs_smoothed, _freq_dbfs_smoothed_idx
-    if _freq_dbfs_smoothed_idx != idx or _freq_dbfs_smoothed is None:
-        _freq_dbfs_smoothed = raw_dbfs
-        _freq_dbfs_smoothed_idx = idx
-    else:
-        _freq_dbfs_smoothed = alpha * raw_dbfs + (1 - alpha) * _freq_dbfs_smoothed
-    return _freq_dbfs_smoothed
-
-
 def _update_spectrum_peaks(band_levels):
     """Peak hold：新值比目前 peak 高就直接跳上去，並重新頂住 _PEAK_HOLD_FRAMES 幀；
     頂住期間完全不落下，時間到了才開始依固定速度慢慢降。
@@ -676,27 +625,24 @@ def _step_freq(delta):
     """上一個/下一個頻率鈕的共用處理——只有在 Spectrum 畫面才生效，避免 PM5D 端誤觸。
     撞到邊界時繞到另一頭（wraparound），不是卡住不動：萬一其中一顆鍵故障，
     另一顆單獨連續按繞一圈還是能到達所有頻段，不會有走不到的死角。
-    清單最後一格（BYPASS_INDEX）是全頻率安全區：current_filter 設回 None，
-    audio_callback 既有的 None 分支（158行）就會直接輸出原始訊號，不用額外寫濾波旁路邏輯。
-    濾波器係數直接在這裡（按鈕回呼的執行緒）重算——這裡不是音訊 RT callback，
-    scipy.signal.butter 不保證能在 RT callback 那~50ms 硬性預算內跑完的顧慮不適用這裡。"""
-    global freq_index, current_filter
+    清單最後一格（BYPASS_INDEX）代表「不選定特定頻段」，純顯示狀態（BAND dBFS／
+    BAND FREQ 顯示 ---／ALL），不影響任何音訊處理——Pi 本來就不輸出音訊。
+    純粹更新 freq_index，不做任何運算，停在哪一格完全零成本。"""
+    global freq_index
     pin = GPIO_PIN_FREQ_PREV if delta < 0 else GPIO_PIN_FREQ_NEXT
     if display_mode != "spectrum":
         print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> ignored, not in spectrum mode", flush=True)
         return
     freq_index = (freq_index + delta) % N_FREQ_STEPS
     if freq_index == BYPASS_INDEX:
-        current_filter = None
-        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, BYPASS（全頻率直通）", flush=True)
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, BYPASS（不選定頻段）", flush=True)
         return
     f_center = OCTAVE_BANDS[freq_index][0]
-    current_filter = _new_filter_state(f_center, BANDPASS_Q)
     print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, f_center={f_center}Hz", flush=True)
 
 
 def main():
-    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history, current_filter
+    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history
 
     DEVICE = _setup_scarlett()
 
@@ -704,10 +650,9 @@ def main():
     ct = threading.Thread(target=compute_loop, daemon=True)
     ct.start()
 
-    # pygame.init() 預設會連 mixer 一起初始化，佔用 ALSA 音訊裝置——階段 3 加入雙工
-    # audio stream 後會跟 sounddevice 搶同一台 Scarlett，導致 duplex stream 開不起來
-    # （PortAudioError: Invalid number of channels / Device unavailable）。這支程式完全
-    # 不用 pygame 播音訊，用 dummy driver 讓 pygame 不碰真實音訊硬體即可解決。
+    # pygame.init() 預設會連 mixer 一起初始化，佔用 ALSA 音訊裝置，曾經跟 sounddevice
+    # 搶同一台 Scarlett 導致 stream 開不起來。這支程式完全不用 pygame 播音訊，用 dummy
+    # driver 讓 pygame 不碰真實音訊硬體即可解決，防禦性保留（零成本，不影響任何行為）。
     os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -761,13 +706,9 @@ def main():
     signal.signal(signal.SIGUSR1, lambda sig, frame: _step_freq(1))
     signal.signal(signal.SIGUSR2, lambda sig, frame: _step_freq(-1))
 
-    # 初始濾波器狀態，對應 freq_index 預設值 0（還沒按過上一個/下一個之前也要有濾波器可用）
-    current_filter = _new_filter_state(OCTAVE_BANDS[freq_index][0], BANDPASS_Q)
-
-    # 雙工 stream：同時收音訊、送音訊。用雙工而不是分開開兩條 stream，是因為兩條獨立
-    # stream 即使接同一台設備，內部時脈/callback 排程還是可能各走各的，長時間會飄移；
-    # 雙工單一 callback 保證收到的音訊跟送出的音訊是同一個時間點對齊的。
-    stream = sd.Stream(
+    # 單工輸入 stream——耳機監聽改回 Scarlett 硬體 Direct Monitor（零延遲），
+    # Pi 只做分析／顯示，不輸出任何音訊。
+    stream = sd.InputStream(
         samplerate=SAMPLE_RATE, device=DEVICE,
         channels=CHANNELS, dtype="float32",
         blocksize=BLOCK_SIZE, callback=audio_callback,
@@ -837,17 +778,16 @@ def main():
                     freq_str = "ALL"
                     dbfs_str = "---"
                 else:
-                    freq_hz       = OCTAVE_BANDS[freq_index][0]
-                    freq_dbfs_raw = band_levels[freq_index] if band_levels else _SPECTRUM_DBFS_LO
-                    freq_str      = _fmt_freq(freq_hz)
-                    dbfs_str      = f"{round(_smoothed_freq_dbfs(freq_dbfs_raw, freq_index))}"
+                    freq_hz  = OCTAVE_BANDS[freq_index][0]
+                    freq_str = _fmt_freq(freq_hz)
+                    dbfs_str = f"{round(_spectrum_peaks[freq_index])}"
 
                 third_h = H // 3
-                draw_number_only_panel(screen, fonts, surf_cache, "MOMENTARY", vals["M"], 0, left_w, 0, third_h,
+                draw_number_only_panel(screen, fonts, surf_cache, "ALL LUFS", vals["M"], 0, left_w, 0, third_h,
                                         num_color=lufs_to_color(vals["M"]))
-                draw_number_only_panel(screen, fonts, surf_cache, "F.F.dBFS", None, 0, left_w, third_h, third_h,
+                draw_number_only_panel(screen, fonts, surf_cache, "BAND dBFS", None, 0, left_w, third_h, third_h,
                                         val_str=dbfs_str, num_color=(255, 255, 255))
-                draw_number_only_panel(screen, fonts, surf_cache, "F.FREQ", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                draw_number_only_panel(screen, fonts, surf_cache, "BAND FREQ", None, 0, left_w, 2 * third_h, H - 2 * third_h,
                                         val_str=freq_str, num_color=(255, 255, 255))
                 for i in (1, 2):
                     pygame.draw.line(screen, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)

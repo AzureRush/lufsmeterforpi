@@ -61,3 +61,31 @@ F.F.dBFS 三個頻率都準確讀到 −20（跟 PM5D 送出的電平一致）�
 初版是「新高點立刻開始降」，上機測完使用者反應降得太快、想要碰到新高點後先頂住一段時間再降。改成 `_spectrum_peak_hold`（[loudness_meter.py:166](loudness_meter.py:166)）——跟 `_spectrum_peaks` 平行的一個「倒數計時」list，每個頻段各自記錄「還要再頂住幾幀」。新高點出現時該格計時器重設成 `_PEAK_HOLD_FRAMES`（1 秒份），計時器 >0 時完全不落下，歸零後才開始用 `_PEAK_DECAY_PER_FRAME` 往下降。最終參數（上機用眼睛調過、使用者確認沒問題）：**頂住 1 秒、回落速度 12dB/秒**（初版 24dB/秒太快，砍半）。
 
 **全頻率安全區**：`BYPASS_INDEX`（[loudness_meter.py:122](loudness_meter.py:122)）是頻率清單之外多加的一格，`N_FREQ_STEPS` 因此變成 31。停在這格時 `current_filter` 設回 `None`，直接借用 `audio_callback` 原本「沒有濾波器就直通」的分支（[loudness_meter.py:257](loudness_meter.py:257)），沒有另外寫旁路邏輯。UI 上這格 F.FREQ 顯示 `ALL`、F.F.dBFS 顯示 `---`，長條圖不反白——`draw_spectrum_panel` 的 `highlight_index == i` 比對在 i 只跑 0~29 時自然不會命中 30，不用額外判斷式。因為插在清單最後一格、靠 wraparound 銜接，「20kHz 之後」跟「25Hz 之前」其實是同一格，不是兩個獨立安全區。
+
+（下面 Stage 4 把 `current_filter`／音訊輸出整個拔掉之後，這一格改成純粹「不選定特定頻段」的顯示狀態，`current_filter` 相關敘述已不成立，僅保留當時決策脈絡。）
+
+## 2026-08-15：Stage 4 回退——移除音訊監聽輸出，改用 Scarlett Direct Monitor
+
+**現象**：Stage 3 完成後實機操作，發現現場除了耳機還有一顆 main out 喇叭同時在響。Pi 雙工 stream 的來回延遲（USB round-trip＋50ms block）疊加房間裡即時的 main out 聲音，造成明顯 ~100ms 回音／山谷感，讓「戴耳機掃頻找刺耳頻率」這個原始目標大打折扣——延遲感本身比找頻率更干擾，判定不可用。
+
+**決定**：耳機監聽改回 Scarlett 硬體 Direct Monitor（零延遲、不經過 Pi），Pi 完全不再輸出任何音訊，回到純視覺化診斷工具。找頻率的方式改成看 Spectrum 畫面＋搭配混音台自己的 EQ 掃頻用耳朵聽。
+
+**保留**：長條圖／Peak hold／BAND dBFS／BAND FREQ／Y 軸、GPIO 三顆按鍵（含 wraparound、SIGUSR1/SIGUSR2 遠端觸發）——這些都跟音訊輸出無關，Stage 3 上機驗證時已證實運作良好。
+
+**移除**：`design_bandpass_filter()`／`_new_filter_state()`／`current_filter`／`BANDPASS_Q`、雙工 `sd.Stream`（改回 `sd.InputStream`）、`audio_callback` 的輸出路由分支。**沒有留死代碼／註解占位**——這批程式碼完整保留在回退前的 git commit（`9299ece`，"feat: GPIO 觸發 Spectrum Analyzer 模式"）裡，之後如果找到更好的低延遲監聽方案，直接 `git show 9299ece:loudness_meter.py` 或 `git diff <回退後commit> 9299ece` 取回即可，不用重寫。
+
+`SDL_AUDIODRIVER=dummy`（原本是為了避免 pygame.mixer 跟雙工 stream 搶 ALSA 裝置）保留下來——改回單工後理論上用不到，但零成本、不影響任何行為，留著當防禦性保險。
+
+## 2026-08-15：Stage 5——BAND dBFS 改用 Peak hold 值、左側三格重新命名
+
+**問題**：BAND dBFS（原名 F.F.dBFS）數字讀值原本用 EMA 平滑（`_smoothed_freq_dbfs()`），上機還是跳得太快看不清楚。Peak hold（`_spectrum_peaks`）已經解決了同樣的「跳太快看不清楚」問題，兩套機制功能重疊。
+
+**改動**：刪掉 `_smoothed_freq_dbfs()` 跟 `_freq_dbfs_smoothed`／`_freq_dbfs_smoothed_idx` 兩個全域變數，數字讀值直接改成 `_spectrum_peaks[freq_index]`——`_spectrum_peaks` 本來就是對「每個頻段」即時追蹤（不是只追蹤目前選定那格），切換頻段時讀到的就是那個頻段當下真實的 peak hold 狀態，效果跟原本 EMA 版「切換頻段立刻重置」一致，不會有違和感。
+
+**重新命名**：Stage 4 把濾波器整個拔掉後，"F." 字首（Filter 的縮寫）不再成立。改名：`MOMENTARY`（Spectrum 畫面左上角這個，Loudness 畫面自己的 MOMENTARY 面板不動）→ `ALL LUFS`（強調全頻率／寬頻，跟下面單一頻段的讀值做區隔）、`F.F.dBFS` → `BAND dBFS`、`F.FREQ` → `BAND FREQ`（"BAND" 字首彼此配對，語意上更準確反映「目前選定的那個頻段」）。三個新名稱都在 10 字元以內，符合這個窄欄位（W/5）的字型自動縮放限制。
+
+## 2026-08-15：README.md 一段 GIF 連結被覆蓋成不相關內容
+
+修改 README.md 的 Spectrum Analyzer 說明時，發現原本設定好的 GIF 連結（`assets/spectrum_analyzer_preview.gif`）已經被換成一個完全不相關的網址（`https://raw.githubusercontent.com/AzureRush/audiorookie/main/1786806821000r9bq2f.gif`，指向使用者另一個 repo、檔名像是某個貼圖工具自動產生的隨機檔名）。比對 `README.md.backup`（同目錄下一個未知來源的舊檔）發現同一段內容也是這個網址，研判是這個問題的線索，但確切原因不明。
+
+本專案開發機在 Google 雲端硬碟同步資料夾裡（`G:\我的雲端硬碟\...`），這類非預期的檔案內容變化，過去在其他專案（x-broadcast）也發生過，懷疑跟雲端同步的版本衝突處理有關。**已修正回正確連結**，但這批被覆蓋的內容已經進了 `9299ece` 那次 commit——commit 本身沒有問題（內容仍是合法的 markdown），只是记錄了這個暫時性的錯誤狀態。若之後還發生類似情況，建議檢查 Google 雲端硬碟該檔案的版本歷史，確認是不是同步衝突造成的。
