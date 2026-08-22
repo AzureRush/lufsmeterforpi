@@ -12,6 +12,12 @@
 
 **踩到的坑（SSH 相關，跟先前 `pkill -f loudness_meter.py` 自我匹配是同一類問題）**：在同一段 SSH 遠端 script 裡用 `PID=$(pgrep -f loudness_meter.py)` 抓 PID，結果連線直接斷掉（exit 255、無輸出）——因為 `pgrep -f` 連執行這段 script 的 shell 自己都算進比對範圍（該 shell 的完整指令字串裡也含有 `loudness_meter.py`），抓到的 PID 混進了 shell 自己的 PID。`kill -USR1 $PID` 送到 shell 自己身上時，因為 shell 對 `SIGUSR1` 沒有自訂處理、預設動作是終止行程，就把整段 SSH session 砍斷了。**教訓**：在 SSH 遠端 script 裡若要對 `loudness_meter.py` 這個行程送訊號，一律用「先前一次獨立的 SSH 呼叫」查好的 PID 當常數帶進去，不要在同一段會被 `pgrep -f` 掃到自己的 script 裡現查。
 
+## 2026-08-22：移除未使用的常數 `MOMENTARY_WIN` / `SHORTTERM_WIN`
+
+整理 README 時發現這兩個常數**從專案早期起就沒有被任何程式碼引用過**，真正決定窗口長度的是 `M_BLOCKS = 8` / `S_BLOCKS = 60`（直接當 deque 的 `maxlen`）。README 的「設定」章節長期把它們列為可調參數，等於叫人改一個改了不會有效果的東西。已從程式碼刪除，`M_BLOCKS`/`S_BLOCKS` 補上換算註解（`8 × 50ms = 400ms`），README 設定章節改列實際生效的常數。
+
+> ⚠️ **此版本尚未部署到 Pi**（2026-08-22 當下 Pi 已離線）。本機版本比 Pi 上執行中的版本新，差異為：SIGHUP 畫面切換觸發（已於離線前上機驗證過）＋本次常數刪除（僅 py_compile 驗證，**尚未實機執行驗證**）。下次連線時需 scp 補上並確認啟動正常。
+
 ## 2026-08-15：GPIO 上一個/下一個頻率腳位第二次對調
 
 **發現過程**：階段 3（步進式帶通濾波器）測試時，KEY10（上一個頻率）一直有「按了沒反應」的現象，原本懷疑是排針接觸不良（2026-08-08 曾重插排線一次，當時看似有改善）。這次上機把 Pi 端 Pin15 的線頭拔下，用電表逐一對 D-sub 25 每支腳量測，發現這條線實際通到的是 PM5D Pin 6（GND），不是文件記載的 Pin 3（GPO5）——代表接線本身錯了，不是接觸不良。

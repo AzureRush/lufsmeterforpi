@@ -57,16 +57,15 @@ def _setup_scarlett():
 
 BLOCK_SIZE  = 2400          # 50ms per block
 
-MOMENTARY_WIN    = 0.4      # 400ms = 8 blocks
-SHORTTERM_WIN    = 3.0      # 3s    = 60 blocks
 TARGET_LUFS      = -23.0
 BLUE_THRESHOLD   = -30.0
 YELLOW_THRESHOLD = -23.0
 RED_THRESHOLD    = -10.0
 FPS              = 20
 
-M_BLOCKS = 8    # blocks needed for M window
-S_BLOCKS = 60   # blocks needed for S window
+# 窗口長度以「幾個 block」表示（BLOCK_SIZE = 50ms），直接決定 deque 的 maxlen
+M_BLOCKS = 8    # 瞬時窗口 400ms
+S_BLOCKS = 60   # 短期窗口 3s
 
 # ─── GPIO（Spectrum Analyzer 觸發，訊源 Yamaha PM5D GPI OUT，UNLATCH 瞬時脈衝） ──
 # 2026-08-15 用電表逐一重新驗證線路後再次修正：KEY10/KEY11（上一個/下一個頻率）

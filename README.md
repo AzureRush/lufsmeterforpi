@@ -310,8 +310,6 @@ _SPECTRUM_DBFS_LO     = -70.0   # 長條圖底部
 _SPECTRUM_DBFS_HI     = 0.0     # 長條圖頂部（0dBFS = 數位滿刻度）
 ```
 
-> ⚠️ 同一區塊還有兩個歷史遺留常數 `MOMENTARY_WIN` / `SHORTTERM_WIN`，**程式中並未使用**，改動它們不會有任何效果。實際窗口長度請改 `M_BLOCKS` / `S_BLOCKS`。
-
 Scarlett 裝置 index 由程式自動偵測，不需手動設定。
 
 ---
