@@ -14,6 +14,12 @@
 
 ## 更新記錄
 
+### 2026-08-15
+- 新增 **Spectrum Analyzer**（頻譜分析儀）第二畫面：GPIO 觸發切換、1/3 Octave 長條圖、可步進式帶通濾波器搭配耳機監聽
+- 長條圖新增 Peak hold（頂住 1 秒後緩慢回落）
+- 頻率步進清單多一格「全頻率安全區」，可暫時關閉濾波、直接監聽原始訊號
+- F.F.dBFS 校準修正：改為左右聲道各自算功率再取平均，避免聲道相位不同時互相抵消
+
 ### 2026-05-20
 - THIS HOUR 大數字顏色跟隨 LUFS 值變化（藍／綠／黃／紅），與 meter bar 一致
 
@@ -54,7 +60,7 @@
 ## 安裝
 
 ```bash
-pip3 install sounddevice pygame scipy numpy
+pip3 install sounddevice pygame scipy numpy gpiozero
 ```
 
 ---
@@ -151,32 +157,38 @@ Select device [1-2]: _
 
 ---
 
-## 自動輸出記錄檔
+## Spectrum Analyzer（第二畫面）
 
-程式會自動將每小時的 THIS HOUR 結果寫入：
+用外部設備（本專案為 Yamaha PM5D）透過 GPI OUT 送觸發訊號到 Pi 的 GPIO，在 Loudness Meter 和 Spectrum Analyzer 之間切換，不需要額外接鍵盤滑鼠或觸控螢幕。
 
-```
-~/loudness_meter/loudness_log.csv
-```
+![gh](https://raw.githubusercontent.com/AzureRush/audiorookie/main/1786806821000r9bq2f.gif)
 
-格式：
+### 用途
 
-```csv
-date,hour,lufs
-2026-04-08,14,-23.1
-2026-04-08,15,-22.8
-2026-04-08,16,---
-```
+搭配窄頻帶通濾波器掃頻監聽，用來找特別刺耳或想消除的頻率——找到之後，實際的 EQ 修正在混音台上做，Pi 本身純粹是視覺＋聽覺診斷工具，不做任何音訊修正。
 
-* 整點觸發，寫入剛結束那個小時的最終積分響度
-* ESC 退出時也會寫入目前這個小時（未完成）的數值
-* `---` 代表該小時幾乎全為靜音（未通過 gating）
+### 操作
 
-查看紀錄：
+三個 GPI 訊號（UNLATCH 瞬時脈衝）：
 
-```bash
-cat ~/loudness_meter/loudness_log.csv
-```
+| 功能 | 行為 |
+|------|------|
+| 畫面切換 | Loudness Meter ↔ Spectrum Analyzer 來回切換 |
+| 上一個/下一個頻率 | 步進移動帶通濾波器對準的頻率，繞邊界會 wraparound（連續按同一顆也能到達所有頻率） |
+
+濾波器對準的頻率，就是耳機監聽孔輸出的內容——換句話說，這個模式下「看到哪根長條被反白」跟「耳朵聽到的聲音」是同一個頻段。頻率清單最後多一格**全頻率安全區**（畫面顯示 `ALL`），停在這格時濾波器關閉、直接監聽原始訊號。
+
+### 畫面配置
+
+左側 W/5 資訊欄（由上而下）：
+
+| 區塊 | 內容 |
+|------|------|
+| MOMENTARY | 瞬時響度（LUFS），跟 Loudness Meter 同一份數值，顏色規則相同 |
+| F.F.dBFS | 目前選定頻段的校準後 dBFS 讀值（真正的數位滿刻度校準，不是相對值） |
+| F.FREQ | 目前選定的頻率 |
+
+右側是 30 條 1/3 Octave 長條圖（IEC 61260 / ANSI S1.11 標準頻段中心頻率），藍色代表目前選定的頻段。每根長條上方有一條白色細線標示 **Peak hold**：碰到新高點後頂住 1 秒，之後以 12dB/秒緩慢回落。長條圖左右兩側都畫有 dBFS 刻度線，範圍依實測校準（-70 ~ -40dBFS 與 -20 ~ 0dBFS 兩端壓縮，-40 ~ -20dBFS 訊號常駐區給最多畫面空間）。
 
 ---
 

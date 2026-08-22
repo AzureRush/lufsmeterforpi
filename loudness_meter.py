@@ -7,12 +7,12 @@ import threading
 import collections
 import datetime
 import time
-import csv
 import os
-from scipy.signal import lfilter
+import signal
+from scipy.signal import lfilter, butter, sosfilt
+from gpiozero import Button
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loudness_log.csv")
 SAMPLE_RATE = 48000
 CHANNELS    = 2
 
@@ -68,6 +68,75 @@ FPS              = 20
 M_BLOCKS = 8    # blocks needed for M window
 S_BLOCKS = 60   # blocks needed for S window
 
+# ─── GPIO（Spectrum Analyzer 觸發，訊源 Yamaha PM5D GPI OUT，UNLATCH 瞬時脈衝） ──
+# 2026-08-15 用電表逐一重新驗證線路後再次修正：KEY10/KEY11（上一個/下一個頻率）
+# 的線路跟原本文件記載的對調（KEY10 實際在 Pin13/GPIO27，KEY11 實際在 Pin15/GPIO22）。
+GPIO_PIN_TOGGLE    = 17   # 實體 Pin 11，畫面切換（PM5D Pin2/GPO3/KEY9）
+GPIO_PIN_FREQ_PREV = 27   # 實體 Pin 13，上一個頻率（PM5D Pin3/GPO5/KEY10）
+GPIO_PIN_FREQ_NEXT = 22   # 實體 Pin 15，下一個頻率（PM5D Pin13/GPO12/KEY11）
+
+BANDPASS_Q = 8.0   # 掃頻濾波器 Q 值（頻寬窄/寬），上機用耳朵調——沒有「正確答案」
+
+# ─── Spectrum Analyzer（1/3 Octave 頻譜顯示，IEC 61260 標準頻率） ─────────────
+SPECTRUM_FFT_SIZE  = 8192   # ~171ms @ 48kHz，頻率解析度 ~5.9Hz
+# 範圍與曲線已依實測校準（2026-08-15）：-23 LUFS 節目訊號時各頻段實際落在 -40~-20dBFS。
+# 比照 LUFS 錶那條非線性曲線的精神，但改成三段式：-70~-40／-20~0 兩端壓縮，
+# -40~-20（訊號常駐區）給最多畫面空間，數字常駐在最好判讀的區域。
+_SPECTRUM_DBFS_LO    = -70.0
+_SPECTRUM_DBFS_SPLIT1 = -40.0
+_SPECTRUM_DBFS_SPLIT2 = -20.0
+_SPECTRUM_DBFS_HI    = 0.0
+_SPECTRUM_FRAC_LOW   = 0.15   # -70..-40 佔畫面高度比例
+_SPECTRUM_FRAC_MID   = 0.70   # -40..-20 佔畫面高度比例（訊號常駐區）
+# 頂端 -20..0 自動是剩下的 1 - FRAC_LOW - FRAC_MID = 0.15
+_SPECTRUM_DBFS_TICKS = [0, -20, -30, -40, -70]
+
+_PEAK_HOLD_SEC        = 1.0    # peak 頂住不落下的時間（秒），上機用眼睛調
+_PEAK_HOLD_FRAMES     = int(round(_PEAK_HOLD_SEC * FPS))
+_PEAK_DECAY_PER_SEC   = 12.0   # 頂住時間過後的回落速度（dB/秒），上機用眼睛調
+_PEAK_DECAY_PER_FRAME = _PEAK_DECAY_PER_SEC / FPS   # 假設穩定 FPS，不用另外量測 dt
+
+# dBFS 校準：Parseval 能量守恆推導——頻段內用「加總」（不是平均）時，
+# 校準基準是 N * sum(window**2) / 4，不是單一 bin 峰值公式，兩者相差 ~1.76dB，
+# 已用合成正弦波（0dBFS/-6dBFS/-20dBFS，100Hz~16kHz）驗證誤差 <0.01dB。
+_HANN_WINDOW        = np.hanning(SPECTRUM_FFT_SIZE)
+_DBFS_REF           = SPECTRUM_FFT_SIZE * float(np.sum(_HANN_WINDOW ** 2)) / 4
+
+_OCTAVE_BAND_CENTERS = [
+    25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315,
+    400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150,
+    4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000,
+]
+
+
+def compute_octave_bands(sample_rate, fft_size):
+    """1/3 Octave 頻段中心頻率與對應 FFT bin 範圍，程式啟動時算一次，不要每幀重算。"""
+    bin_hz = sample_rate / fft_size
+    bands = []
+    for fc in _OCTAVE_BAND_CENTERS:
+        f_lo = fc / (2 ** (1 / 6))
+        f_hi = fc * (2 ** (1 / 6))
+        bin_lo = max(1, int(round(f_lo / bin_hz)))
+        bin_hi = max(bin_lo + 1, int(round(f_hi / bin_hz)))
+        if bin_lo >= fft_size // 2:
+            break
+        bands.append((fc, bin_lo, bin_hi))
+    return bands
+
+
+OCTAVE_BANDS = compute_octave_bands(SAMPLE_RATE, SPECTRUM_FFT_SIZE)
+BYPASS_INDEX = len(OCTAVE_BANDS)   # 頻率清單最後多一格「全頻率安全區」，不濾波、直通原始訊號
+N_FREQ_STEPS = len(OCTAVE_BANDS) + 1
+
+
+def _fmt_freq(hz):
+    """頻率顯示格式：<1000Hz 顯示整數，>=1000Hz 除以 1000 顯示小數（不帶 k 字母，DSEG7 字型相容）。"""
+    if hz < 1000:
+        return f"{int(round(hz))}"
+    v = hz / 1000
+    return f"{v:.2f}".rstrip('0').rstrip('.')
+
+
 # ─── K-weighting filter coefficients for 48kHz (ITU-R BS.1770-4) ─────────────
 _PRE_B = np.array([1.53512485958697, -2.69169618940638,  1.19839281085285])
 _PRE_A = np.array([1.0,              -1.69065929318241,  0.73248077421585])
@@ -92,6 +161,17 @@ lock     = threading.Lock()
 current_hour    = datetime.datetime.now().hour
 reset_hour_flag = False
 _running        = True
+
+display_mode = "loudness"   # "loudness" / "spectrum" — GPIO 畫面切換鈕控制
+freq_index   = 0            # 帶通濾波器目前步進位置
+
+# Peak hold：每個頻段一格，只在原地用索引更新內容，不重新賦值整個 list，不用 global。
+_spectrum_peaks     = [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
+_spectrum_peak_hold = [0] * len(OCTAVE_BANDS)   # 每個頻段「還要再頂住幾幀」的倒數計時
+
+# 目前的帶通濾波器係數＋逐聲道 zi 狀態。按鈕回呼直接整包換一個新 dict 參考給 audio
+# callback 讀，不用上鎖——單一參考重新賦值在 CPython 是原子操作，比照 reset_hour_flag。
+current_filter = None
 
 prev_H   = None   # last completed hour's LUFS（整點 rollover 時更新）
 prev_SEG = None   # last 3-min fixed segment's LUFS（每 3 分鐘快照）
@@ -138,9 +218,32 @@ def compute_h(block_energies):
     return _energy_to_lufs(np.mean(power[m2]))
 
 
-def audio_callback(indata, frames, time_info, status):
-    """Lightweight: only K-weight + 3 deque appends. ~2ms per call."""
+def design_bandpass_filter(f_center, q):
+    """窄頻帶通濾波器係數，SOS 格式（比現有 K-weighting 用的 b/a 格式數值穩定，
+    窄頻濾波器用 b/a 容易不穩定，SOS 是業界標準解法，不要簡化回 b/a）。
+    Q 值決定頻寬窄/寬，上機用耳朵調，沒有「正確答案」。"""
+    bandwidth = f_center / q
+    f_lo = max(20.0, f_center - bandwidth / 2)
+    f_hi = min(SAMPLE_RATE / 2 - 100, f_center + bandwidth / 2)
+    return butter(4, [f_lo, f_hi], btype='bandpass', fs=SAMPLE_RATE, output='sos')
+
+
+def _new_filter_state(f_center, q):
+    """設計濾波器＋建立歸零的 zi 狀態，回傳可以整包原子替換的 dict。"""
+    sos = design_bandpass_filter(f_center, q)
+    zi  = [np.zeros((sos.shape[0], 2)) for _ in range(CHANNELS)]
+    return {"sos": sos, "zi": zi}
+
+
+def audio_callback(indata, outdata, frames, time_info, status):
+    """Lightweight: K-weight + 3 deque appends + 輸出路由。~2ms per call 預算。
+    雙工 stream：同時收音訊（indata）跟送音訊（outdata），比分開開兩條 stream
+    保證兩者是同一個時間點對齊的，掃頻監聽的即時性才有意義。"""
     global _zi_pre, _zi_rlb, reset_hour_flag
+
+    if status:
+        print(f"[AUDIO STATUS] {status}", flush=True)
+
     audio = indata.copy()
 
     if reset_hour_flag:
@@ -154,6 +257,17 @@ def audio_callback(indata, frames, time_info, status):
     buf_s_chunks.append(audio)
     hour_block_energies.append(energies)
     segment_block_energies.append(energies)
+
+    # 輸出路由：Loudness 模式直通（怎麼進怎麼出），Spectrum 模式送濾波後訊號
+    if display_mode == "spectrum" and current_filter is not None:
+        sos = current_filter["sos"]
+        zi  = current_filter["zi"]
+        filtered = np.empty_like(audio)
+        for ch in range(CHANNELS):
+            filtered[:, ch], zi[ch] = sosfilt(sos, audio[:, ch], zi=zi[ch])
+        outdata[:] = filtered
+    else:
+        outdata[:] = indata
 
 
 def compute_loop():
@@ -203,18 +317,6 @@ def compute_loop():
             latest["SEG"] = SEG
 
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
-def _log_hour(dt, lufs_val):
-    """Append one row to the CSV log. Creates file with header if needed."""
-    write_header = not os.path.exists(LOG_PATH)
-    with open(LOG_PATH, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["date", "hour", "lufs"])
-        lufs_str = f"{lufs_val:.1f}" if lufs_val > -70 else "---"
-        w.writerow([dt.strftime("%Y-%m-%d"), dt.strftime("%H"), lufs_str])
-
-
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
     """2 層渲染：黑色外框（16 方向均勻擴展）→ 主色填充。
@@ -256,12 +358,25 @@ _SPLIT_FRAC  =  0.20
 
 
 def _y_ratio(val, lo=-60.0, hi=0.0):
-    """Non-linear map: -60..-40 → bottom 20%, -40..0 → top 80%."""
+    """Non-linear map: -60..-40 → bottom 20%, -40..0 → top 80%. LUFS 錶專用（gating 特性）。"""
     val = max(lo, min(hi, val))
     if val <= _SPLIT_DB:
         return _SPLIT_FRAC * (val - lo) / (_SPLIT_DB - lo)
     else:
         return _SPLIT_FRAC + (1.0 - _SPLIT_FRAC) * (val - _SPLIT_DB) / (hi - _SPLIT_DB)
+
+
+def _spectrum_y_ratio(val):
+    """Spectrum 長條圖專用三段式曲線：-70~-40／-20~0 壓縮，-40~-20（訊號常駐區）給最多空間。
+    刻度線用同一個函式算位置，所以畫面上的間距會跟著這條曲線走，不是等距。"""
+    val = max(_SPECTRUM_DBFS_LO, min(_SPECTRUM_DBFS_HI, val))
+    if val <= _SPECTRUM_DBFS_SPLIT1:
+        return _SPECTRUM_FRAC_LOW * (val - _SPECTRUM_DBFS_LO) / (_SPECTRUM_DBFS_SPLIT1 - _SPECTRUM_DBFS_LO)
+    elif val <= _SPECTRUM_DBFS_SPLIT2:
+        return _SPECTRUM_FRAC_LOW + _SPECTRUM_FRAC_MID * (val - _SPECTRUM_DBFS_SPLIT1) / (_SPECTRUM_DBFS_SPLIT2 - _SPECTRUM_DBFS_SPLIT1)
+    else:
+        frac_hi = 1.0 - _SPECTRUM_FRAC_LOW - _SPECTRUM_FRAC_MID
+        return _SPECTRUM_FRAC_LOW + _SPECTRUM_FRAC_MID + frac_hi * (val - _SPECTRUM_DBFS_SPLIT2) / (_SPECTRUM_DBFS_HI - _SPECTRUM_DBFS_SPLIT2)
 
 
 _HIST_LO  = -41.0   # 歷史色塊高度 0%
@@ -370,7 +485,7 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below', num_color=(255, 255, 255)):
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below', num_color=(255, 255, 255), val_str=None):
     font_title, _, font_value, font_lr, font_delta = fonts
 
     TITLE_H        = 70
@@ -399,7 +514,8 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 10))
 
     num_h   = ph - TITLE_H
-    val_str = _fmt_lufs(val)
+    if val_str is None:
+        val_str = _fmt_lufs(val)
     num_key = ('num_panel', val_str, pw, num_h, num_color)
     if num_key not in surf_cache:
         vs_raw = render_outlined(font_value, val_str, num_color, offset=OUTLINE_OFFSET)
@@ -442,8 +558,145 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     surface.set_clip(None)
 
 
+def compute_spectrum_bands():
+    """取 buf_s_chunks 尾端 SPECTRUM_FFT_SIZE 樣本做 FFT，回傳每個 1/3 Octave 頻段校準過的 dBFS。
+    只在 display_mode == "spectrum" 時才會被呼叫，不背景常駐、不額外開執行緒。
+    頻段內用「加總」不用「平均」——加總才符合 IEC 61260 風格頻段能量的物理意義，
+    也才能讓已知電平的測試音（PM5D 振盪器）準確對上讀值，平均會被空 bin 稀釋。
+    左右聲道「各自」做 FFT 算功率後才取平均，不能先在時域把兩聲道加在一起再做 FFT——
+    兩聲道相位沒對齊時（例如某聲道熱冷線接反）時域平均會互相抵消，功率平均不會，
+    且兩聲道電平/相位正常時數值跟時域平均完全一致，校準基準不用變。"""
+    snap = list(buf_s_chunks)
+    if not snap:
+        return [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
+    audio = np.concatenate(snap)
+    if len(audio) < SPECTRUM_FFT_SIZE:
+        return [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
+
+    window = audio[-SPECTRUM_FFT_SIZE:]
+    power_avg = np.zeros(SPECTRUM_FFT_SIZE // 2 + 1)
+    for ch in range(CHANNELS):
+        spectrum = np.fft.rfft(window[:, ch] * _HANN_WINDOW)
+        power_avg += np.abs(spectrum) ** 2
+    power_avg /= CHANNELS
+
+    levels_dbfs = []
+    for fc, bin_lo, bin_hi in OCTAVE_BANDS:
+        power = float(np.sum(power_avg[bin_lo:bin_hi]))
+        levels_dbfs.append(10 * np.log10(power / _DBFS_REF + 1e-12))
+    return levels_dbfs
+
+
+_freq_dbfs_smoothed     = None
+_freq_dbfs_smoothed_idx = None
+
+
+def _smoothed_freq_dbfs(raw_dbfs, idx, alpha=0.15):
+    """F.F.dBFS 數字讀值用 EMA 平滑——真實音訊逐幀跳動很大，數字直接顯示會快到看不清楚。
+    長條圖本身不套這個（維持即時反應），只有這個數字讀值需要穩定好讀。
+    切換到不同頻段時（idx 變了）立刻重置成新頻段當下值，不會有從舊頻段慢慢爬過去的違和感。"""
+    global _freq_dbfs_smoothed, _freq_dbfs_smoothed_idx
+    if _freq_dbfs_smoothed_idx != idx or _freq_dbfs_smoothed is None:
+        _freq_dbfs_smoothed = raw_dbfs
+        _freq_dbfs_smoothed_idx = idx
+    else:
+        _freq_dbfs_smoothed = alpha * raw_dbfs + (1 - alpha) * _freq_dbfs_smoothed
+    return _freq_dbfs_smoothed
+
+
+def _update_spectrum_peaks(band_levels):
+    """Peak hold：新值比目前 peak 高就直接跳上去，並重新頂住 _PEAK_HOLD_FRAMES 幀；
+    頂住期間完全不落下，時間到了才開始依固定速度慢慢降。
+    只在原地改 _spectrum_peaks／_spectrum_peak_hold 內容，不用 global、不用鎖。"""
+    for i, v in enumerate(band_levels):
+        if v > _spectrum_peaks[i]:
+            _spectrum_peaks[i]     = v
+            _spectrum_peak_hold[i] = _PEAK_HOLD_FRAMES
+        elif _spectrum_peak_hold[i] > 0:
+            _spectrum_peak_hold[i] -= 1
+        else:
+            _spectrum_peaks[i] = max(v, _spectrum_peaks[i] - _PEAK_DECAY_PER_FRAME)
+
+
+def draw_spectrum_panel(surface, fonts, surf_cache, band_levels_dbfs, px, pw, py, ph, highlight_index=None, peak_levels=None):
+    """全螢幕（扣掉左側資訊欄）1/3 Octave 長條圖，長條區左右兩側都畫 dBFS Y 軸刻度。"""
+    font_title, font_scale = fonts[0], fonts[1]
+    TITLE_H = 50
+    MARGIN  = 4
+
+    title_key = ('spectrum_title',)
+    if title_key not in surf_cache:
+        surf_cache[title_key] = font_title.render("SPECTRUM ANALYZER", True, (170, 170, 170))
+    t = surf_cache[title_key]
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
+
+    n = len(band_levels_dbfs)
+    if n == 0:
+        return
+    bar_zone_y = py + TITLE_H
+    bar_zone_h = ph - TITLE_H - MARGIN
+    bar_area_w = pw - MARGIN * 2
+    bar_w      = max(2, (bar_area_w - MARGIN * (n - 1)) // n)
+
+    pygame.draw.rect(surface, (28, 28, 28), (px + MARGIN, bar_zone_y, bar_area_w, bar_zone_h))
+
+    for i, dbfs in enumerate(band_levels_dbfs):
+        bx    = px + MARGIN + i * (bar_w + MARGIN)
+        ratio = _spectrum_y_ratio(dbfs)
+        bh    = int(bar_zone_h * ratio)
+        by    = bar_zone_y + bar_zone_h - bh
+        color = (90, 170, 230) if (highlight_index is not None and i == highlight_index) else (60, 140, 90)
+        pygame.draw.rect(surface, color, (bx, by, bar_w, bh))
+
+        if peak_levels is not None:
+            peak_ratio = _spectrum_y_ratio(peak_levels[i])
+            peak_y     = bar_zone_y + bar_zone_h - int(bar_zone_h * peak_ratio)
+            pygame.draw.rect(surface, (230, 230, 230), (bx, peak_y - 1, bar_w, 2))
+
+    # Y 軸參考：跟長條圖用同一條三段式曲線算位置，刻度間距會跟著曲線走（中段密、兩端疏）
+    for tick in _SPECTRUM_DBFS_TICKS:
+        ty = bar_zone_y + bar_zone_h - int(bar_zone_h * _spectrum_y_ratio(tick))
+        pygame.draw.line(surface, (70, 70, 70), (px + MARGIN, ty), (px + MARGIN + bar_area_w, ty), 1)
+        label_key = ('spectrum_tick', tick)
+        if label_key not in surf_cache:
+            surf_cache[label_key] = font_scale.render(str(tick), True, (150, 150, 150))
+        label = surf_cache[label_key]
+        label_y = max(bar_zone_y, min(bar_zone_y + bar_zone_h - label.get_height(), ty - label.get_height() // 2))
+        surface.blit(label, (px + MARGIN + 2, label_y))
+        surface.blit(label, (px + pw - MARGIN - label.get_width() - 2, label_y))
+
+
+def _toggle_display_mode():
+    global display_mode
+    display_mode = "spectrum" if display_mode == "loudness" else "loudness"
+    print(f"[GPIO DEBUG] toggle fired (GPIO{GPIO_PIN_TOGGLE}) -> display_mode={display_mode}", flush=True)
+
+
+def _step_freq(delta):
+    """上一個/下一個頻率鈕的共用處理——只有在 Spectrum 畫面才生效，避免 PM5D 端誤觸。
+    撞到邊界時繞到另一頭（wraparound），不是卡住不動：萬一其中一顆鍵故障，
+    另一顆單獨連續按繞一圈還是能到達所有頻段，不會有走不到的死角。
+    清單最後一格（BYPASS_INDEX）是全頻率安全區：current_filter 設回 None，
+    audio_callback 既有的 None 分支（158行）就會直接輸出原始訊號，不用額外寫濾波旁路邏輯。
+    濾波器係數直接在這裡（按鈕回呼的執行緒）重算——這裡不是音訊 RT callback，
+    scipy.signal.butter 不保證能在 RT callback 那~50ms 硬性預算內跑完的顧慮不適用這裡。"""
+    global freq_index, current_filter
+    pin = GPIO_PIN_FREQ_PREV if delta < 0 else GPIO_PIN_FREQ_NEXT
+    if display_mode != "spectrum":
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> ignored, not in spectrum mode", flush=True)
+        return
+    freq_index = (freq_index + delta) % N_FREQ_STEPS
+    if freq_index == BYPASS_INDEX:
+        current_filter = None
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, BYPASS（全頻率直通）", flush=True)
+        return
+    f_center = OCTAVE_BANDS[freq_index][0]
+    current_filter = _new_filter_state(f_center, BANDPASS_Q)
+    print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, f_center={f_center}Hz", flush=True)
+
+
 def main():
-    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history
+    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history, current_filter
 
     DEVICE = _setup_scarlett()
 
@@ -451,6 +704,11 @@ def main():
     ct = threading.Thread(target=compute_loop, daemon=True)
     ct.start()
 
+    # pygame.init() 預設會連 mixer 一起初始化，佔用 ALSA 音訊裝置——階段 3 加入雙工
+    # audio stream 後會跟 sounddevice 搶同一台 Scarlett，導致 duplex stream 開不起來
+    # （PortAudioError: Invalid number of channels / Device unavailable）。這支程式完全
+    # 不用 pygame 播音訊，用 dummy driver 讓 pygame 不碰真實音訊硬體即可解決。
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
     pygame.init()
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     W, H   = screen.get_size()
@@ -489,7 +747,27 @@ def main():
 
     pw = W // 3
 
-    stream = sd.InputStream(
+    btn_toggle = Button(GPIO_PIN_TOGGLE, pull_up=True, bounce_time=0.05)
+    btn_toggle.when_pressed = _toggle_display_mode
+
+    btn_freq_prev = Button(GPIO_PIN_FREQ_PREV, pull_up=True, bounce_time=0.05)
+    btn_freq_prev.when_pressed = lambda: _step_freq(-1)
+
+    btn_freq_next = Button(GPIO_PIN_FREQ_NEXT, pull_up=True, bounce_time=0.05)
+    btn_freq_next.when_pressed = lambda: _step_freq(1)
+
+    # 錄影/遠端除錯用：不用碰實體按鍵，SSH 執行 `kill -USR1 <PID>`／`kill -USR2 <PID>`
+    # 就能觸發下一個/上一個頻率，直接呼叫跟按鍵回呼相同的 _step_freq()。
+    signal.signal(signal.SIGUSR1, lambda sig, frame: _step_freq(1))
+    signal.signal(signal.SIGUSR2, lambda sig, frame: _step_freq(-1))
+
+    # 初始濾波器狀態，對應 freq_index 預設值 0（還沒按過上一個/下一個之前也要有濾波器可用）
+    current_filter = _new_filter_state(OCTAVE_BANDS[freq_index][0], BANDPASS_Q)
+
+    # 雙工 stream：同時收音訊、送音訊。用雙工而不是分開開兩條 stream，是因為兩條獨立
+    # stream 即使接同一台設備，內部時脈/callback 排程還是可能各走各的，長時間會飄移；
+    # 雙工單一 callback 保證收到的音訊跟送出的音訊是同一個時間點對齊的。
+    stream = sd.Stream(
         samplerate=SAMPLE_RATE, device=DEVICE,
         channels=CHANNELS, dtype="float32",
         blocksize=BLOCK_SIZE, callback=audio_callback,
@@ -503,16 +781,12 @@ def main():
                     pygame.quit(); sys.exit()
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     _running = False
-                    with lock:
-                        h_val = latest["H"]
-                    _log_hour(datetime.datetime.now(), h_val)
                     pygame.quit(); sys.exit()
 
             now_h = datetime.datetime.now().hour
             if now_h != current_hour:
                 with lock:
                     h_val = latest["H"]
-                _log_hour(datetime.datetime.now().replace(hour=current_hour, minute=0, second=0), h_val)
                 prev_H = h_val if h_val > -70 else None   # 存前一小時值
                 current_hour = now_h
                 reset_hour_flag = True
@@ -538,22 +812,49 @@ def main():
             with lock:
                 vals = dict(latest)
 
-            for idx, (title, val, lr, hist) in enumerate([
-                ("MOMENTARY",       vals["M"], (vals["M_L"], vals["M_R"]), None),
-                ('SHORT TERM (3")', vals["S"], None,                       st_history),
-            ]):
-                draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr, history=hist)
+            if display_mode == "loudness":
+                for idx, (title, val, lr, hist) in enumerate([
+                    ("MOMENTARY",       vals["M"], (vals["M_L"], vals["M_R"]), None),
+                    ('SHORT TERM (3")', vals["S"], None,                       st_history),
+                ]):
+                    draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr, history=hist)
 
-            # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
-            half_h    = H // 2
-            h_delta   = round(vals["H"]) - round(prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
-            seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
-            draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta, num_color=lufs_to_color(vals["H"]))
-            pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-            draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history, delta_align='side')
+                # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
+                half_h    = H // 2
+                h_delta   = round(vals["H"]) - round(prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
+                seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
+                draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta, num_color=lufs_to_color(vals["H"]))
+                pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
+                draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history, delta_align='side')
 
-            for i in (1, 2):
-                pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
+                for i in (1, 2):
+                    pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
+            else:
+                left_w      = W // 5
+                band_levels = compute_spectrum_bands()
+                _update_spectrum_peaks(band_levels)
+                if freq_index == BYPASS_INDEX:
+                    freq_str = "ALL"
+                    dbfs_str = "---"
+                else:
+                    freq_hz       = OCTAVE_BANDS[freq_index][0]
+                    freq_dbfs_raw = band_levels[freq_index] if band_levels else _SPECTRUM_DBFS_LO
+                    freq_str      = _fmt_freq(freq_hz)
+                    dbfs_str      = f"{round(_smoothed_freq_dbfs(freq_dbfs_raw, freq_index))}"
+
+                third_h = H // 3
+                draw_number_only_panel(screen, fonts, surf_cache, "MOMENTARY", vals["M"], 0, left_w, 0, third_h,
+                                        num_color=lufs_to_color(vals["M"]))
+                draw_number_only_panel(screen, fonts, surf_cache, "F.F.dBFS", None, 0, left_w, third_h, third_h,
+                                        val_str=dbfs_str, num_color=(255, 255, 255))
+                draw_number_only_panel(screen, fonts, surf_cache, "F.FREQ", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                                        val_str=freq_str, num_color=(255, 255, 255))
+                for i in (1, 2):
+                    pygame.draw.line(screen, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
+                pygame.draw.line(screen, (55, 55, 55), (left_w, 0), (left_w, H), 1)
+
+                draw_spectrum_panel(screen, fonts, surf_cache, band_levels, left_w, W - left_w, 0, H,
+                                     highlight_index=freq_index, peak_levels=_spectrum_peaks)
 
             pygame.display.flip()
             clock.tick(FPS)
