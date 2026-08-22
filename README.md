@@ -119,14 +119,34 @@ Select device [1-2]: _
 | 畫面一：Loudness Meter | EBU R128 響度監看（M / S / THIS HOUR / SEGMENT） |
 | 畫面二：Spectrum Analyzer | 1/3 Octave 即時頻譜 |
 
-三個 GPI 訊號（UNLATCH 瞬時脈衝、Low Active）：
+### 操作按鍵
 
-| 功能 | 行為 | 生效畫面 |
-|------|------|----------|
-| 畫面切換 | 兩個畫面來回切換 | 兩個畫面皆可 |
-| 上一個 / 下一個頻率 | 移動 Spectrum 畫面上反白的頻段與左側讀值 | **僅 Spectrum 畫面**——在 Loudness 畫面按下會被忽略，避免誤觸改動狀態 |
+在 PM5D 面板的 **USER DEFINED KEYS（Bank A）** 按下對應按鍵即可操作：
+
+| PM5D 按鍵 | 功能 | 行為 | 生效畫面 |
+|-----------|------|------|----------|
+| **KEY 9** | 畫面切換 | 兩個畫面來回切換 | 兩個畫面皆可 |
+| **KEY 10** | 上一個頻率 | Spectrum 畫面上反白的頻段往**低頻**移動一格 | 僅 Spectrum 畫面 |
+| **KEY 11** | 下一個頻率 | Spectrum 畫面上反白的頻段往**高頻**移動一格 | 僅 Spectrum 畫面 |
+
+KEY 10 / KEY 11 在 Loudness 畫面按下會被忽略，避免誤觸改動狀態。
 
 > **切換畫面不會中斷背景運算**：響度計算執行緒持續在跑，THIS HOUR / SEGMENT / 歷史色塊都照常累積，切回 Loudness 畫面時數據不會斷一截。
+
+### GPI 訊號對應
+
+PM5D 端在 `GPI OUT` 設定畫面把三個 PORT 指定為 USER DEFINED KEYS，觸發模式 **UNLATCH**、極性 **Low Active**（GPO 為 open collector，觸發時拉低，與 Pi 端的內部上拉相符）：
+
+| PM5D 按鍵 | GPO / PORT | D-sub 25 針腳 | Pi 實體排針 | BCM GPIO |
+|-----------|-----------|---------------|-------------|----------|
+| KEY 9 | GPO3 / PORT 3 | Pin 2 | Pin 11 | GPIO17 |
+| KEY 10 | GPO5 / PORT 5 | Pin 3 | Pin 13 | GPIO27 |
+| KEY 11 | GPO12 / PORT 12 | Pin 13 | Pin 15 | GPIO22 |
+| （共用接地） | — | Pin 6 | Pin 9 | GND |
+
+三組訊號共用同一條地線即可（觸發電流為微安等級，無串擾疑慮）。Pi 端所需的四支排針剛好相鄰（Pin 9 / 11 / 13 / 15），接線時不易數錯。
+
+> ⚠️ **D-sub 25 的 Pin 9 是 +5V，絕對不要接到 Pi 的任何 GPIO** — Pi 的 GPIO 只接受 3.3V，接上 5V 會燒毀。本專案不需要這條線。（注意別和上表 Pi 端的「實體 Pin 9＝GND」混淆，兩者是不同接頭上的編號。）
 
 ### 遠端觸發（不用碰實體按鍵）
 
@@ -138,7 +158,6 @@ kill -USR1 <PID>   # 下一個頻率
 kill -USR2 <PID>   # 上一個頻率
 ```
 
-`<PID>` 用 `pgrep -f loudness_meter.py` 查。**注意**：不要在同一段 SSH 指令裡用 `pgrep -f` 現查再送訊號——執行該指令的 shell 自己也含有同樣字串、會被一起比對到，訊號會誤送給自己的 SSH session 導致連線中斷。PID 請用前一次獨立的指令查好再帶入。
 
 ---
 
@@ -200,7 +219,7 @@ kill -USR2 <PID>   # 上一個頻率
 
 ### 頻段選擇
 
-用 GPI 的「上一個 / 下一個頻率」移動反白的頻段，左側 BAND dBFS / BAND FREQ 讀值跟著更新。**這只是顯示狀態，不影響任何音訊。**
+用 PM5D 的 **KEY 10 / KEY 11** 移動反白的頻段，左側 BAND dBFS / BAND FREQ 讀值跟著更新。**這只是顯示狀態，不影響任何音訊。**
 
 * 走到清單邊界會 **wraparound** 繞到另一頭——萬一其中一顆鍵故障，另一顆單獨連續按繞一圈仍能到達所有頻段，不會有走不到的死角
 * 頻率清單最後多一格 `ALL`，代表「不選定特定頻段」（BAND dBFS 顯示 `---`、長條圖不反白任何一條）
@@ -239,13 +258,6 @@ pygame main thread（20fps）
                    （毫秒級運算，直接內嵌在 frame 預算內，不另開執行緒）
 ```
 
-**GPIO 按鍵**由 `gpiozero` 自行管理監聽執行緒（`when_pressed` 回呼），**系統訊號**（SIGHUP / SIGUSR1 / SIGUSR2）則在主執行緒執行。兩者都只改動全域狀態變數（`display_mode`、`freq_index`）——單一參考重新賦值在 CPython 是原子操作，不需要額外上鎖。
-
-幾個刻意的設計取捨：
-
-* **Spectrum 不開背景執行緒**：LUFS 需要背景執行緒是因為它得在你看別的畫面時持續累積整小時的數據；頻譜圖沒有這個需求，只有正在看這個畫面時才需要算，因此直接在 frame 內算完就畫，省下一條執行緒、一份共享字典與一次上鎖
-* **Spectrum 重用既有音訊緩衝**：直接取 `buf_s_chunks`（原本給 S 用的 3 秒緩衝）尾端 8192 samples，不另外開緩衝、也完全不動音訊 callback
-* **渲染快取**：文字與數字 surface 以「內容」為 key 快取（`surf_cache`），值沒變就跳過昂貴的描邊渲染與縮放，只留一次 blit。兩個畫面共用同一套機制
 
 ### 計算方法
 
