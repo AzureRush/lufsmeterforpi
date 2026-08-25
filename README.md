@@ -1,10 +1,11 @@
-# 樹莓派響度計
+# 樹莓派多功能 Meter
 
 [![GitHub](https://img.shields.io/badge/GitHub-lufsmeterforpi-blue?logo=github&style=flat)](https://github.com/AzureRush/lufsmeterforpi)
 [![HackMD](https://img.shields.io/badge/HackMD-RasberryPi4B_LUFSMeter-0EA5E9?logo=hackmd&logoColor=white)](https://hackmd.io/@penomadd/RasberryPi4B_LUFSMeter?view)
 
 
-![Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_meter_preview.gif)
+![響度計Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_meter_preview.gif)
+
 
 用小型系統架構提供持續的響度(Loudness)監測方案，提供只有 Mixer 系統內建 Peak Meter 環境下以外的儀表，讓聲音控制更有參考性。
 
@@ -163,7 +164,7 @@ kill -USR2 <PID>   # 上一個頻率
 
 ## 畫面一：Loudness Meter（響度計）
 
-![顯示介面說明](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/Loudness%20meter%20uiux.png)
+![響度計顯示介面說明](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/Loudness%20meter%20uiux.png)
 
 平常監看用的主畫面，分為三個垂直面板：
 
@@ -211,7 +212,8 @@ kill -USR2 <PID>   # 上一個頻率
 
 ## 畫面二：Spectrum Analyzer（頻譜分析儀）
 
-![Spectrum Analyzer 預覽](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/spectrum_analyzer_preview.gif)
+![頻譜分析介面說明](https://raw.githubusercontent.com/AzureRush/audiorookie/main/1787646169000xsow55.png)
+
 
 ### 用途
 
@@ -293,6 +295,8 @@ Loudness Meter（LUFS）        Spectrum Analyzer（dBFS）
 ```
 
 Spectrum 的 Y 軸刻度線與長條高度使用同一條曲線計算，所以刻度間距本身就是非等距的。
+
+![Spectrum Analyzer 預覽](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/spectrum_analyzer_preview.gif)
 
 ---
 
