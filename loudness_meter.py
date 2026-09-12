@@ -247,15 +247,22 @@ def audio_callback(indata, frames, time_info, status):
 
 
 def compute_loop():
-    """Runs at ~10Hz in a separate thread. Does all heavy LUFS computation."""
+    """M / S 以 10Hz 更新；H / SEG 以 1Hz 更新。
+
+    H / SEG 刻意降頻：compute_h() 是 O(n) 全量重算，而 hour_block_energies 會從
+    整點的 0 筆線性長到 72000 筆。其中 np.array(list) 這步是持有 GIL 的，接近整點
+    時單次要數十毫秒，10Hz 呼叫等於長時間霸佔 GIL，音訊 callback 只能排隊 → 造成
+    input overflow。實測（2026-09-12，連續 4 小時）每小時固定重演同一條曲線：整點
+    後靜默約 28 分鐘，之後指數惡化，整點前一分鐘達 4.8 次/秒（約 24% 音訊 block
+    被丟棄），整點歸零後重來。H / SEG 都是長時間積分指標，1Hz 綽綽有餘。"""
+    tick = 0
     while _running:
         time.sleep(0.1)
+        tick += 1
 
         # Snapshot buffer state — fast list copies, GIL-protected
         m_snap   = list(buf_m_chunks)
         s_snap   = list(buf_s_chunks)
-        h_snap   = list(hour_block_energies)
-        seg_snap = list(segment_block_energies)
 
         M = -70.0
         S = -70.0
@@ -283,14 +290,18 @@ def compute_loop():
                 e_total += float(np.mean(sig ** 2))
             S = _energy_to_lufs(e_total) if e_total > 1e-12 else -70.0
 
-        H   = compute_h(h_snap)
-        SEG = compute_h(seg_snap)
-
         with lock:
-            latest["M"]   = M
-            latest["S"]   = S
-            latest["H"]   = H
-            latest["SEG"] = SEG
+            latest["M"] = M
+            latest["S"] = S
+
+        # H / SEG 每秒一次即可（見 docstring）。snapshot 複製本身也是 O(n)，
+        # 一併移進來，不要每 0.1 秒複製一次 72000 筆的 deque。
+        if tick % 10 == 0:
+            H   = compute_h(list(hour_block_energies))
+            SEG = compute_h(list(segment_block_energies))
+            with lock:
+                latest["H"]   = H
+                latest["SEG"] = SEG
 
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
