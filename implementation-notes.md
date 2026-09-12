@@ -2,6 +2,32 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-09-12：`[AUDIO STATUS]` 寫 log 本身就是音訊溢位的元凶
+
+**發現**：8/22 部署那支程式連續跑了 20 天 20 小時（0 例外、0 崩潰），但 `/tmp/lm.log` 長到 **66MB / 227 萬行，其中 99.99% 是 `[AUDIO STATUS] input overflow`**。實測當下發生率 **每秒 4.75 次**——音訊每秒 20 個 block，等於約 1/4 的 block 發生輸入溢位、資料被丟棄，響度讀值因此偏低、不能算準確。
+
+**兩個互相加乘的問題**：
+
+1. **RT callback 裡做同步 I/O**：`audio_callback` 原本是「只要 `status` 有值就 `print(..., flush=True)`」。`flush=True` 是阻塞式寫入，而它就發生在只有約 2ms 預算的音訊 callback 裡。於是形成正回饋：**溢位 → 寫 log → callback 更慢 → 更多溢位**。
+2. **`/tmp` 在這台 Pi 上是 tmpfs（記憶體檔案系統，1.9G）**：那 66MB log 是實打實佔著 RAM。這正是程序記憶體從部署當天 5.5% 一路漲到 8.6% 的主因，不是程式漏記憶體。
+
+**修法**：`status` 改成累計計數、每 60 秒最多印一行（附該期間累計次數），全域 `_status_n` / `_status_t` 各一個。RT callback 內只剩一次整數遞增與一次 `time.monotonic()`，不再有 I/O。
+
+**實測效果**（同樣是無訊號、停在 Loudness 畫面的可比條件下）：
+
+| 指標 | 修正前（跑 20 天） | 修正後（跑 1 分 49 秒） |
+|---|---|---|
+| input overflow | 4.75 次／秒 | **0 次**（log 完全空白） |
+| CPU | 73.9% | **60.1%** |
+| 溫度 | 58.4°C | **53.5°C** |
+| 程序記憶體 | 8.6% | **5.5%** |
+
+溢位歸零這點可以確定不是限流造成的假象——若仍有溢位，第一次發生後 60 秒內必定會印出一行，而觀察期已超過 60 秒仍是空的。
+
+**尚待補驗**：上述數字是在「無音訊訊號 + Loudness 畫面（不跑 FFT）」的最輕負載下量的。有訊號且切到 Spectrum 畫面時是否仍維持 0 溢位，下次有訊號時要再量一次。
+
+**順帶一提**：log 現在每分鐘最多一行，一天約 1440 行（~86KB），放 tmpfs 可接受，暫不做 logrotate。
+
 ## 2026-08-15：SIGUSR1/SIGUSR2 遠端觸發頻率步進（錄 README 用 GIF 的副產品）
 
 錄 Spectrum 模式的 README 預覽 GIF 時，PM5D 端的 KEY10/KEY11 離操作者太遠、也很難精準對到截圖的時機。加了 `signal.signal(SIGUSR1, ...)`／`signal.signal(SIGUSR2, ...)`（[loudness_meter.py:756-759](loudness_meter.py:756)），直接呼叫跟按鍵回呼相同的 `_step_freq(1)`／`_step_freq(-1)`，可以用 `kill -USR1 <PID>`／`kill -USR2 <PID>` 遠端觸發，不用改 `_step_freq` 本身、也沒有新增執行緒。debug log 印出來的訊息仍會標示 `GPIO22`／`GPIO27`（`_step_freq` 內部固定用這兩個常數當標籤），透過訊號觸發時這個標籤其實是不準的、只是沿用同一份程式碼沒有另外處理——純粹是 log 可讀性上的小瑕疵，不影響實際行為。

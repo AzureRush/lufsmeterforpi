@@ -152,6 +152,10 @@ segment_block_energies = collections.deque(maxlen=3600)   # 3min sliding window
 _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
 _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
 
+# audio callback 的 status（input overflow 等）限流用：累計次數 + 上次印出的時間
+_status_n = 0
+_status_t = time.monotonic()   # 每 60 秒最多印一行，附這段期間的累計次數
+
 latest   = {"M": -70.0, "S": -70.0, "H": -70.0, "M_L": -70.0, "M_R": -70.0, "SEG": -70.0}
 lock     = threading.Lock()
 
@@ -215,10 +219,17 @@ def audio_callback(indata, frames, time_info, status):
     """Lightweight: K-weight + 3 deque appends. ~2ms per call 預算。
     單工 input-only stream——Spectrum 模式的耳機監聽改回 Scarlett 硬體 Direct
     Monitor（零延遲），Pi 完全不輸出音訊，純粹是視覺化診斷工具。"""
-    global _zi_pre, _zi_rlb, reset_hour_flag
+    global _zi_pre, _zi_rlb, reset_hour_flag, _status_n, _status_t
 
+    # 溢位時每次都 print 會在 RT callback 裡做同步 I/O，反而加重溢位（而且 /tmp 是
+    # tmpfs，log 直接吃 RAM）。改成計數、每分鐘最多印一行。
     if status:
-        print(f"[AUDIO STATUS] {status}", flush=True)
+        _status_n += 1
+        now = time.monotonic()
+        if now - _status_t >= 60:
+            print(f"[AUDIO STATUS] {status} ×{_status_n} in {now - _status_t:.0f}s", flush=True)
+            _status_n = 0
+            _status_t = now
 
     audio = indata.copy()
 
