@@ -11,6 +11,7 @@ import os
 import signal
 from scipy.signal import lfilter
 from gpiozero import Button
+from lufs_core import EnergyStore   # Rust 擴充模組（lufs_core/），保管 block 能量並負責 H / SEG 的 gating 運算
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 48000
@@ -66,6 +67,11 @@ FPS              = 20
 # 窗口長度以「幾個 block」表示（BLOCK_SIZE = 50ms），直接決定 deque 的 maxlen
 M_BLOCKS = 8    # 瞬時窗口 400ms
 S_BLOCKS = 60   # 短期窗口 3s
+
+# H / SEG 的相對閾值：ITU-R BS.1770-5 Annex 1 官方值是「絕對閾值篩選後平均再 −10 LU」。
+# 2026-09-19 前這裡誤植成 −8（2026-03-27 手寫 compute_h() 取代 pyloudnorm 時的錄入錯誤），
+# 大動態範圍內容的 H 因此偏高最多約 0.46 LU，見 implementation-notes.md。
+RELATIVE_GATE_LU = 10.0
 
 # ─── GPIO（Spectrum Analyzer 觸發，訊源 Yamaha PM5D GPI OUT，UNLATCH 瞬時脈衝） ──
 # 2026-08-15 用電表逐一重新驗證線路後再次修正：KEY10/KEY11（上一個/下一個頻率）
@@ -145,8 +151,11 @@ _RLB_A = np.array([1.0,  -1.99004745483398, 0.99007225036621])
 # Audio callback only appends; compute thread only reads snapshots.
 buf_m_chunks = collections.deque(maxlen=M_BLOCKS)   # ~400ms
 buf_s_chunks = collections.deque(maxlen=S_BLOCKS)   # ~3s
-hour_block_energies    = collections.deque(maxlen=72000)  # 1hr K-weighted energies
-segment_block_energies = collections.deque(maxlen=3600)   # 3min sliding window
+# K-weighted block 能量（[E_L, E_R]）由 Rust 保管，語意同 deque(maxlen=N)。資料放在 Python
+# 這邊的話，每次算 compute_h 都要先整份轉成 Rust/numpy 資料，那步持有 GIL、成本隨累積量成長，
+# 就是 2026-09 那批 input overflow 的根因；改成 callback 只 push、運算在釋放 GIL 後進行。
+hour_store    = EnergyStore(72000)   # 1hr
+segment_store = EnergyStore(3600)    # 3min sliding window
 
 # K-weighting filter states — must stay in audio callback to stay continuous
 _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
@@ -163,8 +172,9 @@ current_hour    = datetime.datetime.now().hour
 reset_hour_flag = False
 _running        = True
 
-display_mode = "loudness"   # "loudness" / "spectrum" — GPIO 畫面切換鈕控制
+display_mode = "loudness"   # "loudness" / "spectrum" / "histogram" — GPIO 畫面切換鈕控制
 freq_index   = 0            # 目前選定/反白的頻段索引，純顯示用（BAND dBFS／BAND FREQ）
+dist_mode    = "hour"       # histogram 畫面的統計範圍："hour" 整點累積 / "slide" 滑動 3 分鐘（KEY10/11 切換）
 
 # Peak hold：每個頻段一格，只在原地用索引更新內容，不重新賦值整個 list，不用 global。
 _spectrum_peaks     = [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
@@ -198,25 +208,90 @@ def k_weight_and_energy(audio):
     return energies
 
 
-def compute_h(block_energies):
-    """EBU R128 two-stage gated integrated loudness from stored block energies."""
-    if len(block_energies) < 2:
-        return -70.0
-    arr   = np.array(block_energies)
-    power = np.maximum(np.sum(arr, axis=1), 1e-12)
-    lufs  = _energy_to_lufs(power)
-    m1 = lufs > -70.0
-    if not np.any(m1):
-        return -70.0
-    rel = _energy_to_lufs(np.mean(power[m1])) - 8.0
-    m2  = lufs > rel
-    if not np.any(m2):
-        return -70.0
-    return _energy_to_lufs(np.mean(power[m2]))
+# ─── LUFS Histogram（響度分布；S 每 0.1 秒投一票，記票式累加） ───────────────────
+# 內部解析度 0.1 LU（libebur128 同款），P10/P95 誤差 ≤ 0.05 LU。
+# 第 0 格 =「≤ -70 LUFS」（低於絕對閾值：不參與 LRA、畫面上併入最左根），第 1..800 格 = -70..+10 LUFS。
+_DIST_PER_LU    = 10
+_DIST_N         = 801
+_DIST_BAR_LO    = -50      # 畫面最左根的中心 LUFS；41 根、每根 1 LU → -50..-10
+_DIST_N_BARS    = 41
+_DIST_BAR_BIN0  = 1 + round((_DIST_BAR_LO - 0.5 + 70.0) * _DIST_PER_LU)   # 最左根對應的第一個內部格（=196）
+_DIST_SLIDE_SEC = 180.0    # 滑動版窗口，對齊 SEGMENT (3')
+_DIST_MIN_N     = 600      # 有效票數 < 60 秒份不算 LRA（剛清零時的數字沒有意義）
+_DIST_FRAC_LO   = 1e-5     # Y 軸（對數）底端 = 0.001%
+
+_DIST_CENTERS = -70.0 + (np.arange(_DIST_N) - 0.5) / _DIST_PER_LU   # 第 i 格的中心 LUFS（第 0 格不使用）
+_DIST_ENERGY  = 10.0 ** ((_DIST_CENTERS + 0.691) / 10.0)            # 對應能量，算相對閾值用
+
+_dist_hour      = np.zeros(_DIST_N, dtype=np.int64)   # 整點累積，整點清零
+_dist_slide     = np.zeros(_DIST_N, dtype=np.int64)   # 滑動 3 分鐘
+_dist_slide_q   = collections.deque()                 # (時間, 格號)，票過期時據此退票
+_dist_hour_seen = current_hour
+
+
+def _dist_bin(s):
+    if s <= -70.0:
+        return 0
+    return min(_DIST_N - 1, 1 + int((s + 70.0) * _DIST_PER_LU))
+
+
+def _dist_feed(s):
+    """compute_loop 每 0.1 秒呼叫一次，投一票。整點版：+1，整點清零。滑動版：新票 +1、
+    過期票 -1（進出帳）。
+    ponytail: 滑動版不要「每幀把窗口內的值重掃分桶」——那是 O(n) 全量重算，就是 compute_h
+    當年造成每小時週期性掉音訊的同一個錯誤。過期用時間判斷（不是固定票數），因為
+    compute_loop 實際頻率略低於 10Hz，固定 1800 票會變成 3 分 20 秒。"""
+    global _dist_hour_seen
+    idx = _dist_bin(s)
+    now = time.monotonic()
+    with lock:
+        if current_hour != _dist_hour_seen:      # 整點：清空整點累積
+            _dist_hour[:] = 0
+            _dist_hour_seen = current_hour
+        _dist_hour[idx]  += 1
+        _dist_slide[idx] += 1
+        _dist_slide_q.append((now, idx))
+        while now - _dist_slide_q[0][0] > _DIST_SLIDE_SEC:
+            _dist_slide[_dist_slide_q.popleft()[1]] -= 1
+
+
+def _dist_snapshot(mode):
+    with lock:
+        return (_dist_hour if mode == "hour" else _dist_slide).copy()
+
+
+def dist_bars(counts):
+    """801 個內部格 → 畫面 41 根（每根 1 LU，中心在整數 LUFS）。超出範圍的併入邊緣根，
+    「低於閾值」格也併進最左根。"""
+    b0   = _DIST_BAR_BIN0
+    bars = counts[b0:b0 + _DIST_N_BARS * _DIST_PER_LU].reshape(_DIST_N_BARS, _DIST_PER_LU).sum(axis=1)
+    bars[0]  += counts[:b0].sum()
+    bars[-1] += counts[b0 + _DIST_N_BARS * _DIST_PER_LU:].sum()
+    return bars
+
+
+def dist_lra(counts):
+    """EBU Tech 3342：絕對閾值（-70，即排除第 0 格）→ 相對閾值（過閾值票的平均能量再 -20 LU）
+    → P10 / P95。回傳 (LRA, P10, P95)；票數不足回 None。
+    相對閾值的基準是「這批 short-term 值自己的平均」，不是 H——舊版（2026-03-27 被刪掉的
+    compute_lra）用的是 integrated_lufs - 20，跟 Tech 3342 的定義不同。"""
+    c  = counts[1:].astype(np.float64)
+    n1 = c.sum()
+    if n1 == 0:
+        return None
+    rel = _energy_to_lufs((c * _DIST_ENERGY[1:]).sum() / n1) - 20.0
+    c[_DIST_CENTERS[1:] <= rel] = 0
+    n2 = c.sum()
+    if n2 < _DIST_MIN_N:
+        return None
+    cdf = np.cumsum(c)
+    p10 = _DIST_CENTERS[1 + int(np.searchsorted(cdf, 0.10 * n2))]
+    p95 = _DIST_CENTERS[1 + int(np.searchsorted(cdf, 0.95 * n2))]
+    return p95 - p10, p10, p95
 
 
 def audio_callback(indata, frames, time_info, status):
-    """Lightweight: K-weight + 3 deque appends. ~2ms per call 預算。
+    """Lightweight: K-weight + 2 deque appends + 2 store pushes. ~2ms per call 預算。
     單工 input-only stream——Spectrum 模式的耳機監聽改回 Scarlett 硬體 Direct
     Monitor（零延遲），Pi 完全不輸出音訊，純粹是視覺化診斷工具。"""
     global _zi_pre, _zi_rlb, reset_hour_flag, _status_n, _status_t
@@ -234,7 +309,7 @@ def audio_callback(indata, frames, time_info, status):
     audio = indata.copy()
 
     if reset_hour_flag:
-        hour_block_energies.clear()
+        hour_store.clear()
         _zi_pre = [np.zeros(2) for _ in range(CHANNELS)]
         _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
         reset_hour_flag = False
@@ -242,8 +317,8 @@ def audio_callback(indata, frames, time_info, status):
     energies = k_weight_and_energy(audio)   # ~1.6ms, stateful — must stay here
     buf_m_chunks.append(audio)              # deque.append is GIL-atomic
     buf_s_chunks.append(audio)
-    hour_block_energies.append(energies)
-    segment_block_energies.append(energies)
+    hour_store.push(*energies)              # 兩個浮點數進 Rust，微秒級
+    segment_store.push(*energies)
 
 
 def compute_loop():
@@ -254,7 +329,10 @@ def compute_loop():
     時單次要數十毫秒，10Hz 呼叫等於長時間霸佔 GIL，音訊 callback 只能排隊 → 造成
     input overflow。實測（2026-09-12，連續 4 小時）每小時固定重演同一條曲線：整點
     後靜默約 28 分鐘，之後指數惡化，整點前一分鐘達 4.8 次/秒（約 24% 音訊 block
-    被丟棄），整點歸零後重來。H / SEG 都是長時間積分指標，1Hz 綽綽有餘。"""
+    被丟棄），整點歸零後重來。H / SEG 都是長時間積分指標，1Hz 綽綽有餘。
+
+    2026-09-19：block 能量改由 Rust 的 EnergyStore 保管，運算在釋放 GIL 之後進行，
+    「整份資料轉換持有 GIL」這個根因已消失；1Hz 維持不動，沒有理由更快。"""
     tick = 0
     while _running:
         time.sleep(0.1)
@@ -289,16 +367,16 @@ def compute_loop():
                 sig = lfilter(_RLB_B, _RLB_A, sig)
                 e_total += float(np.mean(sig ** 2))
             S = _energy_to_lufs(e_total) if e_total > 1e-12 else -70.0
+            _dist_feed(S)   # 窗口還沒填滿 3 秒前的 S 是「沒資料」不是「靜音」，所以只在這裡投票
 
         with lock:
             latest["M"] = M
             latest["S"] = S
 
-        # H / SEG 每秒一次即可（見 docstring）。snapshot 複製本身也是 O(n)，
-        # 一併移進來，不要每 0.1 秒複製一次 72000 筆的 deque。
+        # H / SEG 每秒一次即可（見 docstring）
         if tick % 10 == 0:
-            H   = compute_h(list(hour_block_energies))
-            SEG = compute_h(list(segment_block_energies))
+            H   = hour_store.compute_h(RELATIVE_GATE_LU)
+            SEG = segment_store.compute_h(RELATIVE_GATE_LU)
             with lock:
                 latest["H"]   = H
                 latest["SEG"] = SEG
@@ -636,21 +714,128 @@ def draw_spectrum_panel(surface, fonts, surf_cache, band_levels_dbfs, px, pw, py
         surface.blit(label, (px + pw - MARGIN - label.get_width() - 2, label_y))
 
 
+_DIST_Y_LABELS = [(1.0, "100%"), (0.1, "10%"), (0.01, "1%"), (0.001, "0.1%"), (0.0001, "0.01%")]
+_DIST_X_LABELS = [-50, -40, -30, -23, -20, -10]
+
+
+def _dist_y_ratio(frac):
+    """佔比 → 高度比例，對數刻度：100% 在頂、0.001% 在底，每個十倍一格（共 5 格）。"""
+    if frac <= 0:
+        return 0.0
+    return min(1.0, max(0.0, float(np.log10(frac / _DIST_FRAC_LO) / -np.log10(_DIST_FRAC_LO))))
+
+
+def draw_histogram_panel(surface, fonts, surf_cache, bars, title, px, pw, py, ph):
+    """LUFS 分布長條圖，骨架同 draw_spectrum_panel。X 軸是 LUFS（每根 1 LU），每根用它代表的
+    LUFS 值上色（lufs_to_color），-23 目標線畫成直線；Y 軸是佔比、對數刻度——響度分布集中在
+    目標值附近，線性刻度會看不見兩側尾巴，而爆音與靜音段就藏在尾巴裡。"""
+    font_title, font_scale = fonts[0], fonts[1]
+    TITLE_H = 50
+    MARGIN  = 4
+    LABEL_H = font_scale.get_height() + 4      # 底部 X 軸刻度文字列
+
+    title_key = ('dist_title', title)
+    if title_key not in surf_cache:
+        surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
+    t = surf_cache[title_key]
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
+
+    n          = len(bars)
+    bar_zone_y = py + TITLE_H
+    bar_zone_h = ph - TITLE_H - MARGIN - LABEL_H
+    bar_area_w = pw - MARGIN * 2
+    bar_w      = max(2, (bar_area_w - MARGIN * (n - 1)) // n)
+
+    pygame.draw.rect(surface, (28, 28, 28), (px + MARGIN, bar_zone_y, bar_area_w, bar_zone_h))
+
+    total = int(bars.sum())
+    if total > 0:
+        for k in range(n):
+            if bars[k] == 0:
+                continue
+            bh = max(2, int(bar_zone_h * _dist_y_ratio(bars[k] / total)))   # 有票的根至少 2px，尾巴才看得到
+            bx = px + MARGIN + k * (bar_w + MARGIN)
+            pygame.draw.rect(surface, lufs_to_color(_DIST_BAR_LO + k), (bx, bar_zone_y + bar_zone_h - bh, bar_w, bh))
+
+    # Y 軸參考線（每個十倍一條）與兩側刻度文字
+    for frac, text in _DIST_Y_LABELS:
+        ty = bar_zone_y + bar_zone_h - int(bar_zone_h * _dist_y_ratio(frac))
+        pygame.draw.line(surface, (70, 70, 70), (px + MARGIN, ty), (px + MARGIN + bar_area_w, ty), 1)
+        label_key = ('dist_ytick', text)
+        if label_key not in surf_cache:
+            surf_cache[label_key] = font_scale.render(text, True, (150, 150, 150))
+        label   = surf_cache[label_key]
+        label_y = max(bar_zone_y, min(bar_zone_y + bar_zone_h - label.get_height(), ty - label.get_height() // 2))
+        surface.blit(label, (px + MARGIN + 2, label_y))
+        surface.blit(label, (px + pw - MARGIN - label.get_width() - 2, label_y))
+
+    # -23 LUFS 目標線：判讀重點就是「分布有沒有騎在目標線上」
+    tx = px + MARGIN + int(round(TARGET_LUFS - _DIST_BAR_LO)) * (bar_w + MARGIN) + bar_w // 2
+    pygame.draw.line(surface, (255, 255, 255), (tx, bar_zone_y), (tx, bar_zone_y + bar_zone_h), 3)
+
+    # X 軸刻度文字（LUFS），目標值用白色
+    for v in _DIST_X_LABELS:
+        is_target = (v == TARGET_LUFS)
+        label_key = ('dist_xtick', v, is_target)
+        if label_key not in surf_cache:
+            surf_cache[label_key] = font_scale.render(str(v), True, (255, 255, 255) if is_target else (150, 150, 150))
+        label = surf_cache[label_key]
+        lx = px + MARGIN + (v - _DIST_BAR_LO) * (bar_w + MARGIN) + bar_w // 2 - label.get_width() // 2
+        lx = max(px + MARGIN, min(lx, px + pw - MARGIN - label.get_width()))
+        surface.blit(label, (lx, bar_zone_y + bar_zone_h + 2))
+
+
+def draw_histogram_screen(surface, fonts, surf_cache, W, H, mode, hour_now):
+    """Histogram 整個畫面：左側三格 LRA / P10 / P95，右側分布圖，版面同 Spectrum 畫面。"""
+    left_w  = W // 5
+    third_h = H // 3
+    counts  = _dist_snapshot(mode)
+    stats   = dist_lra(counts)
+    if stats is None:
+        lra_s = p10_s = p95_s = "---"
+        p10_c = p95_c = (255, 255, 255)
+    else:
+        lra, p10, p95 = stats
+        lra_s, p10_s, p95_s = f"{lra:.1f}", f"{round(p10)}", f"{round(p95)}"
+        p10_c, p95_c = lufs_to_color(p10), lufs_to_color(p95)
+
+    draw_number_only_panel(surface, fonts, surf_cache, "LRA", None, 0, left_w, 0, third_h,
+                           val_str=lra_s, num_color=(255, 255, 255))
+    draw_number_only_panel(surface, fonts, surf_cache, "P10", None, 0, left_w, third_h, third_h,
+                           val_str=p10_s, num_color=p10_c)
+    draw_number_only_panel(surface, fonts, surf_cache, "P95", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                           val_str=p95_s, num_color=p95_c)
+    for i in (1, 2):
+        pygame.draw.line(surface, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
+    pygame.draw.line(surface, (55, 55, 55), (left_w, 0), (left_w, H), 1)
+
+    title = f"LUFS HISTOGRAM - THIS HOUR ({hour_now})" if mode == "hour" else "LUFS HISTOGRAM - SLIDING (3')"
+    draw_histogram_panel(surface, fonts, surf_cache, dist_bars(counts), title, left_w, W - left_w, 0, H)
+
+
+_DISPLAY_CYCLE = ("loudness", "spectrum", "histogram")
+
+
 def _toggle_display_mode():
     global display_mode
-    display_mode = "spectrum" if display_mode == "loudness" else "loudness"
+    display_mode = _DISPLAY_CYCLE[(_DISPLAY_CYCLE.index(display_mode) + 1) % len(_DISPLAY_CYCLE)]
     print(f"[GPIO DEBUG] toggle fired (GPIO{GPIO_PIN_TOGGLE}) -> display_mode={display_mode}", flush=True)
 
 
 def _step_freq(delta):
-    """上一個/下一個頻率鈕的共用處理——只有在 Spectrum 畫面才生效，避免 PM5D 端誤觸。
+    """上一個/下一個頻率鈕的共用處理——Spectrum 畫面步進頻率；Histogram 畫面則是兩顆都切換
+    統計範圍（整點累積 ↔ 滑動 3 分鐘，只有兩個選項，方向沒有意義）；Loudness 畫面不生效，避免 PM5D 端誤觸。
     撞到邊界時繞到另一頭（wraparound），不是卡住不動：萬一其中一顆鍵故障，
     另一顆單獨連續按繞一圈還是能到達所有頻段，不會有走不到的死角。
     清單最後一格（BYPASS_INDEX）代表「不選定特定頻段」，純顯示狀態（BAND dBFS／
     BAND FREQ 顯示 ---／ALL），不影響任何音訊處理——Pi 本來就不輸出音訊。
     純粹更新 freq_index，不做任何運算，停在哪一格完全零成本。"""
-    global freq_index
+    global freq_index, dist_mode
     pin = GPIO_PIN_FREQ_PREV if delta < 0 else GPIO_PIN_FREQ_NEXT
+    if display_mode == "histogram":
+        dist_mode = "slide" if dist_mode == "hour" else "hour"
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> dist_mode={dist_mode}", flush=True)
+        return
     if display_mode != "spectrum":
         print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> ignored, not in spectrum mode", flush=True)
         return
@@ -794,6 +979,8 @@ def main():
 
                 for i in (1, 2):
                     pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
+            elif display_mode == "histogram":
+                draw_histogram_screen(screen, fonts, surf_cache, W, H, dist_mode, current_hour)
             else:
                 left_w      = W // 5
                 band_levels = compute_spectrum_bands()

@@ -2,6 +2,106 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-09-19：Rust `EnergyStore` 接管 H / SEG ＋ LUFS Histogram 上線
+
+**做了什麼**：① `lufs_core` 升到 0.2.0，新增 `EnergyStore`（block 能量由 Rust 保管）；② `loudness_meter.py` 改用它算 THIS HOUR / SEGMENT，並把 relative gate 修正成 −10；③ 新增 LUFS Histogram 畫面（整點累積／滑動 3 分鐘）。同日部署上 Pi（PID 222768 起）。
+
+### 決策 1：不照原計畫「只把 compute_h 換成 Rust」，改成資料也放 Rust
+
+原計畫階段一是逐行移植 `compute_h(list)`。上機前先在 Pi 上實測（n = 72000，資料形狀同正式版：deque 裝 `[E_L, E_R]` 的 Python list）：
+
+| 項目 | 耗時（中位數 / 最大） |
+|---|---|
+| `list(deque)` | 8.4 / 10.9 ms |
+| `np.array(list)` | 52.9 / 61.6 ms |
+| Python `compute_h` 整體 | 63.5 / 69.5 ms |
+| Rust `compute_h(list)` 整體 | 21.0 / 24.4 ms |
+
+再用一條每 1 ms 醒一次的 ticker 執行緒量「主執行緒算 compute_h 時別的執行緒被卡多久」：Python 版最大遲到 68.6 ms，Rust 版（仍傳整份 list）35.8 ms。**只換函式，GIL 卡頓只減半**——Rust 快在運算，但把 72000 筆 list-of-list 轉成 Rust 資料（約 20 ms）本身還是持有 GIL。而殘餘溢位的起點（整點後約 28 分、累積約 33600 筆）對應的卡頓約 33 ms，36 ms 落在邊緣，預期只能降一半、不會歸零。
+
+所以改成資料放 Rust：`EnergyStore`（語意同 `deque(maxlen=N)`）。callback 每個 block `push` 兩個浮點數（實測 0.5 µs／次）；`compute_h()` 只在持鎖複製一份快照（72000 筆約 1 MB）時佔著 GIL，運算在 `py.detach()` 釋放 GIL 之後做。使用者選了這個方案。
+
+實作上的幾個小決定：
+- `#[pyclass(frozen)]` ＋ 內部 `Mutex`：所有方法都是 `&self`，不需要 PyO3 的執行期借用檢查。
+- 鎖用 `unwrap_or_else(|e| e.into_inner())`：不讓 Mutex poison 變成 audio callback 裡的例外——callback 一丟例外 stream 就停了，響度計會變成「沒當機但完全沒數字」。
+- 持鎖複製快照時 GIL 也在呼叫端手上，callback 不可能同時 `push`，兩邊不會互相卡；運算階段不持鎖，callback 完全不受影響。
+- 沒有保留 Python 版 `compute_h` 當 fallback：`from lufs_core import EnergyStore` 是硬 import。**日後若重建 Pi 上的 venv，要重裝 wheel**（`pip install --no-index --no-deps lufs_core-0.2.0-....whl`），否則響度計起不來。純函式版 `compute_h` 留在 Rust 模組裡，只給 `test_compute_h.py` 對照用。
+
+### 決策 2：relative gate −8 → −10（官方值）
+
+使用者選定修正。新增 `RELATIVE_GATE_LU = 10.0` 常數，H / SEG 都吃它。**這是正確性修正、會改變顯示值**：一般節目幾乎不變，大動態範圍內容（古典樂／紀錄片）THIS HOUR / SEGMENT 會比之前低最多約 0.46 LU（−10 的閾值比 −8 低，多納入一些較安靜的 block，平均自然略低）。−8 的來龍去脈見下一節（09-18）。
+
+### 決策 3：Histogram 的設計選擇
+
+- **統計來源**：`compute_loop` 每 0.1 秒算出的 S（3 秒 short-term）。窗口填滿前不投票——那時 S = −70 代表「沒資料」，不是「靜音」。
+- **內部解析度 0.1 LU、801 格**（第 0 格 =「≤ −70 LUFS」即低於絕對閾值，第 1..800 格 = −70..+10 LUFS），畫面聚合成 41 根（−50..−10，每根 1 LU）。不直接用 1 LU 分桶：P10 / P95 誤差會到 ±0.5 LU，LRA 可能差到 1 LU。0.1 LU 是 libebur128 同款，誤差 ≤ 0.05 LU；實測對照精確解（不分桶、直接對原始值算）LRA 只差 0.03 LU。
+- **左側顯示 P95，不是計畫寫的 P90**：EBU Tech 3342 的 LRA = P95 − P10，顯示 P90 會讓 LRA ≠ 上下緣相減，是計畫的筆誤。
+- **LRA 的相對閾值基準**：這批 S 值自己（過絕對閾值後）的平均能量再 −20 LU，照 Tech 3342。git 裡被刪掉的舊 `compute_lra()`（`6d3695c`）用的是 `integrated_lufs - 20`，跟標準的定義不同，所以沒有直接照抄。
+- **有效票數 < 600（60 秒份）時 LRA / P10 / P95 顯示 `---`**：剛整點清零時幾筆資料算出來的 LRA 沒有意義。
+- **滑動版過期用「時間」判斷，不是固定票數**：`compute_loop` 實際頻率略低於 10 Hz（`sleep(0.1)` 加迴圈本身耗時），固定 1800 票會變成 3 分 20 秒以上。用進出帳（新票 +1、過期票 −1），**絕對不能改成每幀重掃窗口**——那就是 `compute_h` 當年 O(n) 全量重算的翻版（`_dist_feed` docstring 已標 `ponytail:`）。
+- **整點清零用 `current_hour` 比對，不用計畫寫的 `reset_hour_flag`**：那個 flag 會在 50 ms 內被 audio callback 消耗掉（`reset_hour_flag = False`），每 100 ms 才跑一次的 `compute_loop` 可能剛好錯過。
+- 兩個統計（整點／滑動）**永遠都在累加**，不論目前顯示哪個畫面，切過去就有完整資料。實測成本（Pi 4B）：投票 5.7 µs／次（0.1 秒一次）；畫 Histogram 畫面時每幀 LRA 123 µs ＋ 分桶 40 µs ＋ 快照 4.5 µs，約 0.35% CPU。
+- Y 軸用**對數佔比**（100% → 0.001%，每十倍一格）：響度分布集中在目標值附近，線性刻度看不見兩側尾巴，而爆音與靜音段正好在尾巴裡。有票的根至少畫 2 px。
+- **操作**：KEY9 循環 loudness → spectrum → histogram；Histogram 畫面下 KEY10 / KEY11（`SIGUSR1` / `SIGUSR2` 同）都是切換統計範圍，只有兩個選項所以方向沒有意義；Loudness 畫面下仍然忽略。遠端切畫面的 `SIGHUP` 自動跟著變三循環。
+
+### 驗證方法（之後改畫面都能用）
+
+- **離屏渲染**：在 Pi 上用 `SDL_VIDEODRIVER=dummy` 另開一個行程，import 新版 `loudness_meter.py` 直接呼叫 `draw_histogram_screen()` 存 PNG。不用重啟正在跑的響度計就能反覆調版面（重啟會清掉當小時累積、還會讓整點對齊亂掉）。
+- **`test_histogram.py` 直接 import 真的 `loudness_meter`**，把 `sounddevice` / `pygame` / `gpiozero` 用 `MagicMock` 擋掉（不是把函式複製進測試，改了正式版不用同步）。檢查：LRA / P10 / P95 對精確解、滑動版進出帳不漂移（窗口內票數 = 重掃最近 180 秒的結果）、邊緣併根與 −23 對位、整點清零、票數不足回 `None`。
+- `test_compute_h.py` 補了 `EnergyStore` 的檢查（未滿／剛好滿／繞圈／`clear()` 後重用／不同 gate），筆電與 Pi 上結果一致（差 ≤ 3.55e-15）。
+
+### 部署與還原
+
+- 舊版備份：Pi 上 `~/loudness_meter/loudness_meter.py.bak_20260919`；舊版 log（含連續 6.8 天的溢位紀錄）：`~/lm_before_20260919.log`。
+- 還原：`cp ~/loudness_meter/loudness_meter.py.bak_20260919 ~/loudness_meter/loudness_meter.py` 後重啟（舊版不 import `lufs_core`，venv 裡多裝的 wheel 不礙事）。
+
+### 監測結果（Pi 時間 12:00–13:00，整個小時週期；畫面全程停在 Loudness、期間沒有任何按鍵／切畫面事件、PM5D 訊號持續）
+
+對照組是舊版連續 24 個整點小時（09-18 11:00 ~ 09-19 10:59，同樣 Loudness 畫面，用 `tools/timeline.py` 從 log 還原）。「溢位次數」= 被 PortAudio 標記 input overflow 的 callback 次數，「損失」= 次數 ÷（3600 秒 × 每秒 20 個 block）。
+
+| | 舊版（24 個整點小時） | 新版（12:00–13:00） |
+|---|---|---|
+| 溢位次數／小時 | 731 ~ 950（平均約 820） | **0**（log 完全沒有 `[AUDIO STATUS]` 行） |
+| 損失 block 比例 | 1.0 ~ 1.3%／小時 | **0%** |
+| 峰值分鐘 | 0.71 ~ 0.76 次/秒（每一小時都落在 +54~+59 分） | 0 |
+| 整點後 +50 分的溢位率 | 0.46 次/秒 | 0 |
+| 瞬時 CPU | 63.5%（整點後 +41 分實測） | 平均 59.6%，六個 10 分鐘段落 58.6 ~ 61.6%，**不再隨整點相位上升** |
+| 溫度 | 56.4°C | 平均 55.0°C、最高 56.9°C，無降頻旗標 |
+| 記憶體 | 325 MB（連跑 6.8 天，從 5.5% 長到 8.4%，約 +17 MB／天） | 253 → 260 MB（該小時內 +7.3 MB，前快後慢，含 EnergyStore 逐漸填滿約 1.2 MB） |
+
+整段運轉（11:49 ~ 13:05，1 小時 16 分）log 只有啟動訊息與人工切畫面測試的 5 行 `[GPIO DEBUG]`。啟動 60 秒內的溢位事件不會被限流機制印出來，但那之後任何一次都會立刻印一行，所以「0 行」等於整個評估小時 0 次。
+
+**CPU 沒有大降是預期內的**：`top -H` 分執行緒量（Loudness 畫面）主執行緒（pygame 渲染）約 38%、計算執行緒（M / S 每 0.1 秒重算）約 14%、音訊 callback 約 5%。H / SEG 本來就不是 CPU 大戶——它們的問題是「持有 GIL」，不是「吃 CPU」，所以修掉 GIL 卡頓解決的是掉音訊，不是 CPU。往後真的想降 CPU，槓桿在渲染（沒變化的畫面不必每幀重畫）與 M / S 的計算方式，不在 H / SEG。Histogram 畫面比 Loudness 畫面輕（47 ~ 53%，沒有大字型 blit 與歷史色塊的 alpha 混合）。
+
+**還沒驗證的**：只有 1 個整點小時的樣本（舊版 24 個）——0 對 820 已經很明確，但長時間穩定性（記憶體斜率是否收斂、跨日、PM5D 訊號中斷再恢復）要再觀察幾天；`/tmp/lm.log` 現在只會在真的有溢位時才長行，隔天看 `wc -l /tmp/lm.log` 就知道（沒有異常會停在 9 行加上之後的手動切畫面行）。
+
+### 之後可重用的工具（`tools/`）
+
+- `timeline.py`：把 lm.log 的 `[AUDIO STATUS] ×N in Xs` 還原成分鐘級時間軸（log 沒有時間戳，以 log 檔 mtime 為錨點、用各行的 `in Xs` 往回推）。`--hours 24` 列逐小時基準表與整點相位剖面。
+- `lm_monitor.py`：Pi 上跑的 10 秒取樣器（CPU%／RSS／溫度／降頻旗標寫成 CSV），只用標準函式庫，`lm_monitor.py <響度計 PID> <csv> <結束 epoch>`。
+- `render_hist.py`：離屏渲染 Histogram 畫面存 PNG（Pi 上跑，路徑寫死 `/tmp/lmtest` 與 `~/loudness_meter/fonts`，用法見檔頭註解）。
+
+### 順帶發現：Pi 的系統時鐘比筆電快約 3.5 分鐘，且沒有校時
+
+`timedatectl` 顯示 `System clock synchronized: no`（Pi 直連 PM5D／筆電、沒有網際網路，NTP 校不到，也沒有 RTC）。響度計的整點清零跟 `THIS HOUR (N)` 標籤都是照 Pi 的時鐘走，所以（以筆電時鐘為準）實際上比整點提早約 3.5 分鐘歸零。這次沒有動它（要 `sudo` 改系統設定，且是否需要對準真實時間是使用者的判斷）；上面所有時間都是 Pi 時間。
+
+## 2026-09-18：Rust 移植 compute_h() 第一步——`lufs_core`
+
+**動機**：09-12 那次修完 log 風暴與 H/SEG 降頻後，殘餘 3.2% 音訊損失的根因是結構性的（Python GIL，`np.array(list)` 持有 GIL 且成本隨小時累積線性成長）。降頻率只能壓低、消不乾淨，長期方向是 Rust 接管計算、Python 只管畫面。今天先打通管線：只移植 `compute_h()`，其餘（K-weighting／FFT／音訊 I/O）留待之後。
+
+**查證：官方 relative gate 是 −10 LU，現有 Python 版的 `-8.0` 是錯的**——直接讀取 ITU-R BS.1770-5（2023 現行版）官方 PDF 原文確認：「the second at −10 dB relative to the level measured after application of the first threshold」，此值從 BS.1770-2（2011）引入後從未變過。−8 從來不是任何一版官方數值。**這是獨立於 Rust 移植之外的正確性 bug**，`loudness_meter.py` 目前跑在 Pi 上用的就是 -8——要不要修 Python 正式版，等使用者決定。Rust 版把這個值做成參數（`relative_gate_lu`，預設 10.0），方便對照腳本同時驗證兩個值。
+
+**產出**：`lufs_core/`（PyO3 + maturin，`abi3-py38`），`compute_h()` 逐行對應移植；`test_compute_h.py`（四組合成資料：全靜音／單一爆音／正常分布／邊界附近，斷言 Python 版與 Rust 版差 < 1e-9）全數通過（diff 0 或 3.55e-15）；交叉編譯出 `lufs_core-0.1.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl`（410KB .so），尚未上機測試。
+
+**踩到的坑（都是本機 Windows 建置環境特有，不影響 Pi 上的實際部署，因為 Linux 的符號解析機制完全不同）**：
+
+1. `extension-module` feature 在 Windows 用 `cargo build`/`maturin build` 直接建置本身就會失敗——PyO3 官方已知行為，Linux/macOS 靠 dlopen 延遲解析不需要 import lib，Windows 一定要
+2. 新版 rustc（1.98）對 abi3 + Windows 預設啟用 raw-dylib 連結（`cargo:rustc-cfg=pyo3_use_raw_dylib`），理論上不需要 `.lib` 檔，但在這台機器上實測會連結失敗（`LNK2019` 整批未解析符號）。裝了 `lib.exe` 到 PATH、開了 `generate-import-lib` feature 都沒用，最後用環境變數 **`PYO3_USE_RAW_DYLIB=0`** 強制退回傳統連結才成功——這個環境變數之後每次在這台機器本機編譯都要記得帶
+3. `zig.exe`／`lib.exe` 都是「裝好了但沒進這個 shell 的 PATH」的同一種坑——`ziglang` pip 套件把 `zig.exe` 放在套件目錄底下，不是 `Scripts`；MSVC 的 `lib.exe` 跟 `link.exe` 裝在同一個 Build Tools 目錄，但只有 `link.exe` 被 cargo 內部機制自動找到
+4. 交叉編譯到 `aarch64-unknown-linux-gnu`（真正要交付的目標）**完全沒遇到上述任何問題，一次就過**——上面三個坑都是 Windows 原生建置本身的環境問題，不是 zig／交叉編譯路線的問題，跟計劃裡原本評估的風險點（「交叉編譯環境最容易卡住」）方向不太一樣，反而是本機測試環境先卡住
+
+**尚未做**：把 `.whl` scp 上 Pi、`python -c "import lufs_core"` 確認能載入、在 Pi 上重跑一次對照腳本、接進 `loudness_meter.py` 取代現有 `compute_h()`。這些都需要 Pi，排在下次值班（histogram 那次）一起做。
+
 ## 2026-09-12（第二輪）：H / SEG 降頻至 1Hz，消除每小時週期性掉音訊
 
 **發現經過**：修掉上一節的 log 風暴後，浮現出一條原本被掩蓋的曲線。因為 log 沒有時間戳，是靠每行的 `in Xs` 間隔累加還原出絕對時間軸（腳本留在 `/tmp/timeline.sh`），才看出**每小時固定重演同一個週期**：
