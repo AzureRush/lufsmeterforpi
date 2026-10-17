@@ -2,6 +2,21 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-10-17（第三輪）：第二次四畫面輪流監測（有訊號）＋ 校正 Pi 時鐘
+
+**監測**（Pi 14:48 ~ 17:28，同第一次的排程；這次進度回報多一欄「訊號」：間隔 3 秒截兩張圖比對整個畫面，靜音時整個畫面靜止。**全程都有訊號**）：
+
+| 畫面 | CPU 平均 | 最高 | 第一次（靜音） |
+|---|---|---|---|
+| Loudness | 48.6% | 52.2% | 47.0% |
+| Spectrum | 61.6% | 67.8% | 60.8% |
+| Histogram 整點版 | 39.2% | 46.0% | 37.4% |
+| Histogram 滑動版 | 37.5% | 39.3% | 36.2% |
+
+溢位 0、Traceback 0、電壓不足 0 次（累計仍 11）、RSS 255 → 255 MB、溫度最高 54.0°C、15 次切畫面正常、跨 15:00／16:00／17:00 三次整點。有訊號比靜音每個畫面高約 1 ~ 2 個百分點（新數字要拼圖、長條實際在動）。**這次才是有訊號情況下四個畫面的有效證據**，補上第一次的缺口。訊號判斷第一版只比對左上角，讀值穩定時誤判成靜音，改成比對整個畫面才準。
+
+**校正 Pi 時鐘**：Pi 快約 18.6 分鐘（10/9 是 11 分、9/19 是 3.5 分，約每天快 0.5 分鐘；`timedatectl`：NTP active 但沒有可用的伺服器、沒有 RTC）。改時間要 sudo、sudo 要密碼——依安全規則不代使用者輸入密碼、也不代改權限設定，請使用者自己設定 `/etc/sudoers.d/020_penomad-date`（`penomad ALL=(root) NOPASSWD: /usr/bin/date`，先寫暫存檔、`visudo -cf` 驗證語法再 `install -m 440`）。驗證：`sudo -k` 清掉剛輸入密碼的暫存後，一般 sudo 要密碼、只有 date 免密碼。校時流程（腳本 `remote_timesync.sh`）：`pkill -f "python.*loudness_meter/loudness_meter.py"` → `sudo -n /usr/bin/date -s @<筆電 epoch>` → `run.sh`。結果 17:37:28 → 17:18:51，與筆電差 1 ~ 2 秒（SSH 延遲）；響度計重啟、預熱 0.70 秒、THIS HOUR (17) 正確。之後每次連上 Pi 可順手做（寫進本機 `CLAUDE.md`）；長期解法是加 RTC 模組（如 DS3231）。
+
 ## 2026-10-17（第二輪）：可攜性——一鍵安裝（B 方案，筆電端完成、待乾淨 Pi 實測）
 
 **起因**：使用者想在另一台 Pi 快速部署。盤點正式機（唯讀）：Pi OS 桌面版 Trixie 64-bit（2026-04-13 映像）、自動登入 labwc、Python 3.13.5、venv `include-system-site-packages = true`；venv 自有 numpy 2.4.4／scipy 1.17.1／sounddevice 0.5.5／pygame 2.6.1／lufs_core 0.2.0（另有用不到的 pyloudnorm、cffi 是 sounddevice 的相依）；gpiozero／lgpio 走 apt。沒有開機自動啟動；`cmdline.txt` 有 `video=HDMI-A-1:1920x1080i@60`，現在的 720p 是手動 `wlr-randr`。
