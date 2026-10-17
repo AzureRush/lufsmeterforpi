@@ -2,7 +2,194 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
-## 2026-09-19：Rust `EnergyStore` 接管 H / SEG ＋ LUFS Histogram 上線
+## 2026-10-17（第二輪）：可攜性——一鍵安裝（B 方案，筆電端完成、待乾淨 Pi 實測）
+
+**起因**：使用者想在另一台 Pi 快速部署。盤點正式機（唯讀）：Pi OS 桌面版 Trixie 64-bit（2026-04-13 映像）、自動登入 labwc、Python 3.13.5、venv `include-system-site-packages = true`；venv 自有 numpy 2.4.4／scipy 1.17.1／sounddevice 0.5.5／pygame 2.6.1／lufs_core 0.2.0（另有用不到的 pyloudnorm、cffi 是 sounddevice 的相依）；gpiozero／lgpio 走 apt。沒有開機自動啟動；`cmdline.txt` 有 `video=HDMI-A-1:1920x1080i@60`，現在的 720p 是手動 `wlr-randr`。
+
+**做了什麼**：
+- `requirements.txt`（固定版本，不含 gpiozero／lgpio／pyloudnorm）。查過 PyPI：四個套件都有 aarch64 + cp313 的預編 wheel，安裝時不必現場編譯
+- `wheels/lufs_core-0.2.0-…aarch64….whl` 進 repo（SHA256 `28948bb6…`，與正式機 pip 安裝紀錄一致）。改了 Rust 要記得更新這個檔
+- `install.sh`：檢查（非 root、aarch64、有 labwc、Python ≥ 3.8、wheel 在）→ apt → gpio／audio 群組 → venv（`--system-site-packages`）＋ pip ＋ wheel → import 自我檢查 → 解析度 → 自動啟動。可重複執行
+- **自動啟動用 `~/.config/autostart/*.desktop`，不用 `~/.config/labwc/autostart`**：查過這版 Pi OS 的 `/etc/xdg/labwc/autostart` 會啟動 pcmanfm-pi（桌面）、wf-panel-pi（工作列）、kanshi，最後跑 `lxsession-xdg-autostart`（讀 `~/.config/autostart/`）。labwc 只讀第一個找到的 autostart——在使用者資料夾放自己的那份會**取代**系統那份，桌面和工作列就不會啟動
+- **解析度用 kanshi（`~/.config/kanshi/config`），不改 `/boot/firmware/`**：kanshi 本來就在系統 autostart 裡、設定檔原本是空的；Pi OS 的「螢幕設定」工具存的也是它。HDMI-A-1／A-2 各寫一個 profile（kanshi 依目前接著的輸出挑）。已有別的設定就不覆蓋
+- `run.sh`：路徑改用腳本所在資料夾、`/run/user/$(id -u)`、已在跑就不重複開、`--autostart`（等 3 秒讓 kanshi 先套好解析度）、`--restart`（`pkill -f "python.*$DIR/loudness_meter.py"`——只比對 python 程序，**SSH 遠端下也不會像 `pkill -f loudness_meter.py` 那樣連自己的連線一起砍**）、stdin 接 `/dev/null`
+- `loudness_meter.py`：`_setup_scarlett()` → `select_input_device(devices, want, interactive)`。順序：`LM_AUDIO_DEVICE`（裝置名稱一部分）→ Scarlett/Focusrite → 有 tty 才互動詢問，否則自動選第一個 ≥ 2 聲道的輸入。**修掉的 bug**：舊版一律 `input()`，開機自動啟動沒有 stdin → `EOFError` 被 `except` 吃掉 → 無限迴圈卡死；現在 Ctrl-D 也會結束。`LM_AUDIO_DEVICE` 要寫在 `~/.config/labwc/environment`（labwc 讀這個檔並傳給子程序；`environment.d` 不一定會帶進桌面 session）。順手刪掉沒用到的 `import subprocess`
+- `.gitattributes`：`*.sh text eol=lf`——這個 repo `core.autocrlf=true`，工作區是 CRLF，從筆電直接 scp `.sh` 上 Pi 會讓 bash 壞掉
+- `test_device_select.py`：mock `query_devices`，驗證指定名稱／Scarlett／無鍵盤自動選（跳過單聲道）／沒有輸入裝置結束／有鍵盤時照舊詢問、輸錯重問、Ctrl-D 結束——不會再停下來等輸入
+- README 草稿安裝與操作章節改寫成新流程
+
+**還沒做**：乾淨 Pi 實測（要空的 SD 卡＋能上網；正式機那台在現場沒網路，不能直接拿來測）；正式機換上新版 `loudness_meter.py`／`run.sh`（跟下次部署一起；正式機不跑 install.sh）；commit。
+
+## 2026-10-17：四畫面輪流監測（160 分鐘）
+
+**設計**：Loudness → Spectrum → Histogram 整點 → Histogram 滑動，各 10 分鐘 × 4 輪（Pi 11:29 ~ 14:09，跨 12:00／13:00 整點），排程腳本在 Pi 上獨立跑（從 log 讀出當前畫面與 hist_mode，再用 HUP／USR1 切換；USR1 只在 Histogram 畫面送，Spectrum 畫面它是移頻段）。`tools/lm_monitor.py` 多記一欄 `ovf_total`（log 裡所有 `[AUDIO STATUS] ×N` 的 N 加總）。吸取 10/9 教訓：本機每 10 分鐘才連一次、只在 4 個時間點截圖。
+
+**結果**（每段去掉切換後前 30 秒）：
+
+| 畫面 | CPU 平均 | 最高 | 4 輪平均的範圍 |
+|---|---|---|---|
+| Loudness | 47.0% | 49.8% | 46.8 ~ 47.1 |
+| Spectrum | 60.8% | 67.8% | 59.9 ~ 61.6 |
+| Histogram 整點版 | 37.4% | 40.1% | 36.9 ~ 38.4 |
+| Histogram 滑動版 | 36.2% | 37.8% | 36.0 ~ 36.5 |
+
+溢位 0、Traceback 0、15 次切畫面都正常、RSS 251 → 251 MB、溫度最高 54.0°C、**電壓不足 0 次**（10/9 之後累計仍是 11）。四輪之間的差異都在 2 個百分點內，數字很穩。
+
+⚠️ **整段 160 分鐘 PM5D 都沒送訊號**（Histogram 截圖：只有 Pi 11:21 ~ 11:29 有聲音，正好在監測開始時斷掉；12、13 點整小時空白）。事後確認 Pi 端正常：Scarlett 一直在 `lsusb`／`arecord -l`、今天 kernel 沒有任何 USB 斷線紀錄、收音執行緒持續在跑，且使用者恢復送訊後畫面立刻有讀值（M −24、THIS HOUR (14) −23）——是 PM5D 端沒送。**影響**：CPU 數字有效（每幀工作量與訊號大小無關），但「0 溢位」沒有考驗到新數字的情境；有訊號下的穩定性證據仍以 10/9 那一小時與之後 7 天 18 小時 0 溢位為準。**教訓：長時間監測要在開始後先確認有訊號，並在進度回報裡帶一個「目前讀值」**——這次的進度回報只看 CPU／溢位，看不出靜音。
+
+## 2026-10-09：大數字改單一字元快取（C 方案）＋ 軸文字／X 軸標示／peak hold 3 秒
+
+**判斷依據（10/3 部署的 `[CACHE]` 診斷 log，連跑 5 天 21 小時）**：7 次溢位**全部**落在「快取剛長出新圖」的 10 分鐘區間（49 個這樣的區間）；快取沒長的 799 個區間 0 次。其中 5 次發生時沒有任何按鍵——是電平變化帶出沒見過的數字。快取 72 → 688 張、16.5 → 94 MB，前三天長得快之後趨緩但仍在長；最大宗 `num_panel` 486 張。照 plan 判斷條件 → 做 C。另實測舊做法遇到新數字的成本（Pi 離屏）：**中位數 27.5 ms、最慢 32 ms**，電平一變常是 M／S／L／R 同時換新，一幀可達上百 ms——先前一直寫「數十毫秒」是推估，這次才量到。
+
+**實作**：
+- **兩層快取**：字元層 `_glyph_set`（每個「字型 × 描邊 × 縮放比 × 調色盤」組合，第一次用到就把整套 16 個字元 × 調色盤每色畫完）＋ 整串層（`('text_lru',)` 的 `OrderedDict`，上限 48，滿了丟最久沒用的）。第一版只有字元層、逐字直接貼到畫面：**整張 Loudness 畫面每幀 7.7 → 16.1 ms**——每個字元的描邊層四周都有一圈空白，一串要疊 6~8 張半透明圖，面積是整張圖的好幾倍。加整串層後回到 8.1 ms；沒命中時只是用現成字元拼一張（中位數 3.6 ms、最慢 6 ms），不再現場描邊縮放
+- **描邊分兩層畫**：每字元存描邊層與本體層，拼字時先畫完所有描邊、再畫所有本體——一字一字各自畫完的話，下一字往外擴的描邊會蓋到上一字的本體。字距用 `font.size(前綴)` 量，與以前整串 render 排版一致
+- **縮放比改成每格固定**：以該格最寬可能字串為準（`_LUFS_REFS`／`_LRA_REFS`／`_FREQ_REFS`）。**外觀變化（使用者看過對照圖後同意）**：以前每個字串各自放大塞滿格子，`-9`、BAND FREQ 的 `1` 特別大；現在字大小固定、短數字較小
+- **開機預熱 `warm_glyph_cache`**：三個畫面（Histogram 兩種模式）各離屏畫一次，**在 `with stream:` 之前**——這一兩秒的大量渲染若發生在收音中，就是溢位的成因。實機 0.70 秒、37 筆。為了讓預熱與實際繪圖走同一份程式，Loudness／Spectrum 畫面從主迴圈抽成 `draw_loudness_screen`／`draw_spectrum_screen`
+- `render_outlined` 拆出 `_outline_layer`（像素結果不變），現在只剩軸文字在用；`_log_cache` 支援 dict 值（字元組），否則診斷 log 會在繪圖迴圈裡丟例外
+- 字型建立抽成 `make_fonts(W)`，`tools/render_hist.py`／`tools/bench_draw.py` 改呼叫它（以前各自複製一份字級公式）。⚠️ `/tmp/lmtest` 底下要 symlink `fonts/`，否則離屏測試會退回 monospace
+- **`test_glyphs.py`（Pi 上跑，需要真的 pygame）**：預熱後把三個畫面用所有可能數值（LUFS −75 ~ +2、所有頻段＋ALL、LRA 0.0 ~ 39.9、變化量）畫一遍，斷言數字快取一筆都不增加；整串快取不超過上限；沒命中拼圖 < 10 ms；字元集外／調色盤外不崩潰。結果：預熱後 0 增加、快取總量固定約 26 MB
+
+**同時上的 UI 修改（2026-10-08 以 Pillow 模擬圖逐版和使用者對過）**：軸文字 40 px（`round(60 × W / 1920)`）＋ 2 px 黑描邊 ＋ 60% 透明（`set_alpha(153)`）；不印 −70（線保留、角落留給 X 軸文字）；Histogram 拿掉底部文字列（圖高 646 → 666，與 Spectrum 完全對齊）；滑動版 X 軸 `3'`／`2'`／`1'`／`now`；Spectrum X 軸 80／400／1k／6.3k（10k 與 6.3k 只差 2 根會疊字，拿掉）；垂直輔助線畫在 bar 之前；peak hold 1 → 3 秒；選定頻段 peak 改黃色 4 px。已知小缺點：選定頻段在最右側時，peak 可能被右側 Y 軸文字蓋住（使用者接受）。
+
+**監測（Pi 時間；部署 17:09）**：
+
+| 畫面 | 時段 | CPU 平均 | 溢位 | 記憶體 |
+|---|---|---|---|---|
+| Loudness | 17:11 ~ 18:11（含 18:00 整點） | 48.0%（六段 47.5 ~ 48.3%） | **0** | +4.0 MB，快取 39 → 40 筆（多的是新標題 `THIS HOUR (18)`） |
+| Spectrum | 18:11 ~ 18:31 | 60.5% | 0 | 持平 |
+| Histogram 整點版 | 18:31 ~ 18:51 | 38.4% | 0 | 持平 |
+
+⚠️ **18:13 ~ 18:38 間 PM5D 訊號大多是靜音**（Histogram 整點版截圖可見），Spectrum／Histogram 那兩段的「0 溢位」沒有真正考驗到新數字（靜音時數字固定 `---`），CPU 數字仍有效（每幀工作量與訊號大小無關）。Loudness 那一小時大多有訊號，那段才是有力證據。
+
+**新發現的硬體問題：電壓不足（Under-voltage）**。`vcgencmd get_throttled` 由 0x0 變 0x50000（曾電壓不足＋曾降頻）。這兩個位元從開機累計，Pi 已開機 140 天、今天 11:56 查時還是 0 → **140 天來第一次**。`journalctl -k` 今天共 11 次 `Undervoltage detected!`，每次 2 ~ 4 秒恢復。一開始集中在我於 Pi 上跑離屏測試與截圖的時段，我判斷是測試造成；但**監測期間我沒有碰 Pi 時又發生了（17:33、18:2x、18:4x，其中一次 CPU 只有 38%）**——是電源本身的問題，已建議使用者檢查電源（官方 5.1 V / 3 A）與 USB-C 線。這期間沒有造成溢位。（註：`dmesg -T` 的時間戳與 journal 差了約 75 分鐘，以 journal 為準）
+
+**10/17 追蹤（連跑 7 天 18 小時）**：溢位 **0**、Traceback 0（舊版 5.9 天 7 次）；RSS 約 250 MB 持平（舊版 6 天 225 → 305 MB）；快取 39 → 64 筆後停住、30 ~ 37 MB——多出來的全是標題（`THIS HOUR (0)`~`(23)` 各一張，一天跑完一輪就到頂）。**電壓不足：10/9 之後 0 次**（日誌是持久保存的 `/var/log/journal`，且沒有重開機，紀錄完整）——11 次全集中在 10/9 16:09 ~ 18:44。**更正 10/9 的判斷**：當天說「沒碰 Pi 時也會發生、是電源本身」，但之後 8 天正常運作 0 次，比較合理的解釋是那天 Pi 上一直有額外負載（監測取樣程式、定時截圖、SSH），電源平常撐得住、餘裕小。旗標 0x50000 是 10/9 留下的累計值，要重開機才歸零。
+
+**部署**：還原點 Pi 上 `~/loudness_meter/loudness_meter.py.bak_20261009`（= 10/3 版 fec9b1f5）；上一版 6 天的 log 在 `~/lm_run4_20261003-1009.log`。
+
+**README**：新版草稿 `README.draft.md`（白話介面說明＋頁尾名詞備註）與三張新 GIF（`assets/loudness_preview.gif`／`spectrum_preview.gif`／`histogram_preview.gif`，Pi 上連續截圖 + ffmpeg 兩階段調色盤，約 2 fps）。第一次錄時 PM5D 剛好靜音、Loudness 40 張完全相同，等訊號恢復後重錄。
+
+## 2026-10-03：Loudness 畫面降載（10 FPS、拿掉兩條小色塊）＋ Histogram 滑動版改 3 分鐘 ＋ 快取診斷
+
+**起因**：使用者問把 SHORT TERM (3") 與 SEGMENT (3') 下方的 20 格小色塊、以及大跳動 BAR 拿掉能省多少。先依計畫上機量，再決定。（名稱更正：大跳動 BAR 在 MOMENTARY 與 SHORT TERM；小色塊在 SHORT TERM 與 SEGMENT，THIS HOUR 沒有。）
+
+**上一版連跑 13 天 21 小時（9/19 17:18 → 10/3 14:22）**：總共只有 4 次溢位（約每 3.5 天 1 次），無降頻。但 RSS 254 → 346 MB（約每天 +6.6 MB），`smaps` 顯示全部在主 `[heap]`（94 → 179 MB），Rust／計算執行緒 arena 不動。**9/19 寫的「推估主 heap 上限約 150 MB」是錯的**——已經超過，見下面的快取診斷。
+
+**量測（Pi 4B，同一路 PM5D 訊號）**
+
+M1 逐元件繪圖成本（離屏 dummy driver，`tools/bench_draw.py`，不含 `flip`）：
+
+| 元件 | 每幀 |
+|---|---|
+| 整張 Loudness 畫面 | 13.8 ms |
+| 兩條小色塊（SHORT TERM 2.1 ＋ SEGMENT 2.7，含 SEGMENT 那張整格底色） | **約 5.6 ms** |
+| 兩個大跳動 BAR（底色＋填色＋−23 線） | 1.1 ms |
+
+推算時我估色塊只要 2.3 ms、`flip` 加固定開銷約 10 ms——實際色塊貴兩倍多（每格兩次 fill ＋ 一次 alpha blit ＋ 描邊，× 40 格），`flip` 側只約 5.6 ms（主執行緒 19.4 ms/幀 − 繪圖 13.8 ms）。
+
+M2 幀率 A/B（`top -H -d 30`，30 秒平均；B 組重複量三次，結果穩定）＋ 最終版：
+
+| 版本（Loudness 畫面） | 主執行緒 | 計算執行緒 | 整個行程 |
+|---|---|---|---|
+| A：原版 20 FPS | 39.1% | 13.2% | 61.7% |
+| B：10 FPS | 23 ~ 25% | 17 ~ 19% | 48 ~ 52% |
+| **最終：10 FPS ＋ 拿掉兩條色塊** | **19.4%** | 17.5% | **44.4%** |
+
+- **我預估 10 FPS 省 19 個百分點，實際約 10 個**：主執行緒少了 15 個百分點，但計算執行緒多了約 5 個。推測：20 FPS 時渲染一直佔著 GIL，`compute_loop` 被擠到實際約 8.8 Hz（9/19 從歷史圖取樣間隔 1.14 秒推得），讓出來後更接近設計的 10 Hz，迴圈跑得多 CPU 就多——M/S 反而更新得更準。**未驗證**（要看取樣間隔是否變短）。
+- M3 順手量 Spectrum 畫面：**56.1%，比 Loudness 還輕**。每幀兩次 8192 點 FFT 沒有想像中貴，所以 Spectrum 不動（也就不必改由 `FPS` 推導的 peak hold 常數）。
+
+**決策（使用者選）**：10 FPS ＋ 拿掉兩條小色塊；大跳動 BAR 保留（只省約 1 個百分點）。
+
+**改動**：
+- `_SCREEN_FPS = {"loudness": 10, "spectrum": FPS, "histogram": 5}`，`clock.tick(_SCREEN_FPS[display_mode])`。`FPS` 仍是 20，因為 Spectrum 的 peak hold 兩個常數由它推導
+- 色塊相關全刪：`draw_history_strip`、`_HIST_LO/_HIST_REF`、兩個 panel 函式的 `history` 參數、`st_history`（只有色塊在用）與它每 3 秒的快照計時器、`draw_number_only_panel` 的半透明標題底（`title_bg`，唯一用途是讓標題壓在色塊上還看得見；底色與 `screen.fill` 同色，拿掉後像素不變）
+- **`seg_history` 也刪了**：SEGMENT 的變化量原本用 `seg_history[-1]`，它永遠等於 `prev_SEG`（同一處、同時更新），改用 `prev_SEG`
+- 結果：Loudness 整張畫面繪圖 13.8 → 7.7 ms
+
+**Histogram 滑動版：10 分鐘 → 3 分鐘，固定 60 根 × 3 秒**（使用者定案：「3' 整個畫面、3" 一根 bar」，對齊 SEGMENT 與 Short Term 窗口長度；LRA 跟著改算最近 3 分鐘）：
+- **視窗起點對齊 3 秒整數倍**：`t0 = (now // 3 − 59) × 3`。原本的 `now − 600` 每幀平移，3 秒一根的話同一筆樣本會在相鄰兩根之間跳、畫面會閃；對齊後每 3 秒整齊往左捲一格，最右一根是正在累積的這 3 秒。`test_histogram.py` 加了一條斷言：同一筆樣本在同一個 3 秒內（+0.2、+2.9 秒）欄位不變，跨邊界剛好左移一欄
+- 1016 px ÷ 60 除不盡：欄邊界用 `i × bar_area_w // n`，16 / 17 px 交錯；每根留 2 px 縫，一格一格看得出來（整點版 508 欄 × 2 px 不留縫，算式統一後結果與以前相同）
+- X 軸刻度改每 1 分鐘（−3 / −2 / −1 / 0）；標題自動變 `SLIDING (3')`
+- LRA 不用改：`_tl_build` 本來就只拿視窗內的樣本算。3 分鐘約 158 筆，`_TL_MIN_N = 60` 照舊。已知取捨：3 分鐘的 LRA 比 10 分鐘更容易被單一段落左右，使用者已知悉
+
+**快取診斷 log（新增 `_log_cache`，常駐）**：每 10 分鐘印一行 `[CACHE] n=張數 MB rss=… 各類張數`（開機 1 分鐘後第一筆）。目的：判斷 heap 成長是不是 `surf_cache`——快取 MB 跟著 RSS 漲就是它，RSS 漲但快取不動就是別的（例如記憶體碎片）。一小時監測固定在 Loudness 畫面，測不到我懷疑的元兇（Histogram 左下 LRA 帶一位小數、每個新值多一張大圖），所以讓它常駐，下次連線時就有好幾天、三個畫面都用過的資料。開機 1 分鐘：72 張、16.5 MB，其中 `lr`（L/R 數字）已 40 張。
+
+**部署**：還原點是 Pi 上的 `~/loudness_meter/loudness_meter.py.bak_20261003`（= 9/19 時間軸版，md5 `d69b7c82…`）。上一版 14 天的 log 存在 `~/lm_run2_20260919-1003.log`。
+
+**監測結果**（使用者 15:30 要離開，評估區間改為部署後一小時：Pi 時間 14:35 ~ 15:35，含 15:00 整點滾動；畫面全程 Loudness、無任何切換）：
+
+| | 9/19 舊版（同畫面一小時） | **本版** |
+|---|---|---|
+| 溢位 | 0 | **0** |
+| CPU 平均 | 59.6% | **46.9%**（最小 36.9、最大 50.1；六段 10 分鐘 46.1 ~ 47.4%，平穩） |
+| RSS | +7.3 MB／小時 | +18.4 MB（234 → 253；前 10 分鐘就佔 +12，含部署後切畫面驗證留下的快取） |
+| 溫度 | 平均 55°C | 平均 50.7°C、最高 52.5°C，無降頻 |
+
+- 30 秒點測量到 44.4%，一小時平均 46.9%——點測略偏低，以一小時為準：**比原版省約 13 個百分點**
+- 我先前說 CPU 從 44% 緩升到 48% 是「整點累積造成、整點後會回落」——15:00 後沒有回落，**此推測不成立**，比較像訊號內容造成的波動
+- 整點滾動正常：`THIS HOUR (15)`、變化量 −2；**SEGMENT 變化量改用 `prev_SEG` 後正常顯示**（截圖確認）
+- 快取診斷：72 張（1 分鐘）→ 189（11 分）→ 200 → 202 → 213 → 220 張（51 分）、40.7 MB；畫面停在 Loudness 時逐漸趨緩，但電平一變就再長（主要是 L/R）。下一步見 plan 檔最後一節（C 方案：單一字元快取）
+
+**三畫面點測（評估區間結束後，Pi 15:35，各 20 秒）**：
+
+| 畫面 | 主執行緒 | 整個行程 | 對照 |
+|---|---|---|---|
+| Loudness（一小時平均） | — | 46.9% | 原版 61.7%（30 秒）／59.6%（一小時） |
+| Spectrum（未改動，20 FPS） | 34.3% | 57.2% | 今天部署前 56.1% → 一致 |
+| Histogram 整點版 | 11.6% | 38.6% | 9/19 一小時 38.7% → 一致 |
+| Histogram 滑動版（60 根 × 3 秒） | 8.9% | **31.3%** | 長條從 254 根減為 60 根，最輕 |
+
+**點測期間出現 1 次溢位**（評估區間外）：log 順序是 `toggle -> spectrum` → `[AUDIO STATUS] input overflow ×1 in 3675s` → `toggle -> histogram`，也就是**剛切到 Spectrum 的那一刻**（同時 `top` 也在跑）。切畫面時要一次現場畫一批沒快取過的數字與標題（Spectrum 左欄的 `ALL LUFS`／頻段數字等），每張數十毫秒、持有 GIL——**這是「快取沒命中造成溢位」推測的第一筆直接旁證**（仍不能排除 `top` 的影響）。加上 9/19 17:34 那次也發生在 RSS 跳一階之後，C 方案的優先度提高。
+
+**現在最重的畫面變成 Spectrum（57%）**。它跑 20 FPS，若要再降，同樣可以降幀率，但 peak hold 的兩個常數由 `FPS` 推導，要一起改。
+
+**順帶**：Pi 時鐘比筆電快約 11 分鐘（9/19 是 3.5 分鐘），約每天快 0.5 分鐘，仍未校時。
+
+## 2026-09-19（第二輪）：Histogram 改為時間軸響度歷史圖（取代分布圖）
+
+**起因**：使用者要的 histogram 是 Process.Audio Decibel 那種——**X 軸時間、Y 軸響度**——不是我第一輪做的統計分布圖（X = LUFS、Y = 佔比，`ab41370`）。計畫當時寫的「X 軸是 LUFS」我沒有特別跟使用者確認，是理解落差；使用者原話的「整點清零／滑動窗口」其實就是時間軸的兩種視窗。下面「第一輪」章節的分布圖設計（決策 3）已被取代，保留作紀錄。
+
+**規格（使用者確認）**：X = 時間；Y = LUFS，**與 Spectrum 同一條三段式曲線與刻度**（−70~−40 窄、−40~−20 寬、−20~0 窄；刻度 0 / −20 / −30 / −40 / −70）；長條顏色照 `lufs_to_color`；值 = Short Term，每秒一筆；−23 白色水平線；**整點版** X = 整點起 0~60 分、整點後清空重長，**滑動版** = 最近 10 分鐘（KEY10/11 切換，操作不變）；左側三格 `MOMENTARY` / `SHORT TERM (3")` / `LRA`（標題寫法照 Loudness 畫面；P10 / P95 不再顯示）。不疊 THIS HOUR 折線。
+
+**實作（計畫階段先過 ponytail 審視，砍掉的東西比新增的多）**：
+- **時間序列**：`deque(maxlen=4000)` 存 `(time.time(), S)`，`compute_loop` 的 1 Hz 區塊在 S 窗口填滿時 append。窗口沒填滿就不寫——時間上的空缺本來就是圖上的空缺，不需要 NaN。**整點版用「時間 ≥ 本整點起點」篩選，整點一過視窗自然移走，不需要另寫清零邏輯**（第一輪還得靠 `current_hour` 比對做清零）
+- **`tl_columns()`**：依時間分欄、欄內取最大值（`np.fmax.at`）。欄寬：整點版 2 px（≈ 7 秒／欄）、滑動版 4 px（≈ 2.4 秒／欄）——取樣約每 1.14 秒一筆，每欄至少 2 筆才不會在取樣抖動時出現空洞。**測試抓到的坑**：只用 `astype(int)` 會往 0 截，視窗起點「之前」的樣本（負的小數）會被算進第 0 欄，要先 `np.floor`
+- **不做 Surface 快取，Histogram 畫面改 5 FPS**（`clock.tick(5 if display_mode == "histogram" else FPS)`，一行）：資料本來就每秒才變一次。快取每幀還是要 blit 1.87 ms（+3.7% CPU），降幀率整個主執行緒的每幀成本（fill／flip／數字格）都成比例縮小。代價：KEY 切換的畫面反應最長慢 200 ms
+- **Y 軸與 Spectrum 對齊**：把 `draw_spectrum_panel` 裡畫刻度線與兩側刻度文字的迴圈抽成共用的 `_draw_dbfs_ticks()`，兩張圖各呼叫一次，不複製、不改 `_spectrum_y_ratio`。**抽出前後 Spectrum 的離屏渲染 PNG 逐位元相同**（md5 一致），沒有改到既有畫面
+- **標題寫法照 Loudness 畫面**：`MOMENTARY` 實測 252 px 放得進左欄格寬 256 px；`SHORT TERM (3")` 約 420 px 放不下，`draw_number_only_panel` 標題比格寬長時等比縮小（約 59%，快取 key 含 `pw`，避免 Loudness 畫面的 `draw_panel` 拿到縮小過的版本）。備案：左欄由 W//5 加寬到 W//3，標題不必縮，圖窄約 170 px——先不做，看實機
+- **LRA 改直接對時間序列算，刪掉第一輪的分布票數機制**（`_dist_*`：801 格票數、10 Hz 投票、時間過期佇列、整點清零、`dist_lra`、`dist_bars`，約 −150 行含測試）：abs gate −70 → rel gate −20 LU（過閘樣本平均能量）→ `np.percentile` 取 P95 − P10，每秒（有新樣本時）重算一次。**代價**：LRA 輸入從約 9 Hz 降為 1 Hz——用 40 組合成節目序列實測，整點版平均差 0.05 LU（最大 0.15）、滑動 10 分鐘版平均差 0.1 LU（最大 0.43），遠小於 Tech 3342 測試容許的 ±1 LU；且 `compute_loop` 實際約 8.8 Hz，本來就沒達 Tech 3342 要求的 ≥ 10 Hz 下限。滑動版的 LRA 窗口跟著圖從 3 分鐘改成 10 分鐘
+
+**驗證**：
+- `test_histogram.py` 對 **EBU Tech 3342 V4 Table 1 的最低要求測試案例**：兩段差 10 LU → 10.00、差 5 LU → 5.00、差 20 LU → 20.00、五段（含兩段被相對閘門擋掉）→ 15.00，全部在 ±1 LU 內且精準命中；另測分欄歸屬、視窗選取（整點版／滑動版／整點清空／空序列）。筆電與 Pi 都通過
+- 離屏渲染（`tools/render_hist.py`，合成「安靜 → 大聲 → 靜音空檔 → 中等」）看整點版、滑動版、剛整點三種狀態；同一支腳本也渲染 Spectrum 做逐位元比對
+
+**設備 loading 評估（Pi 4B 實測單次成本，未上機前的推算）**：畫 508 根 2 px 長條 4.0 ms（254 根 4 px 2.5 ms）、blit 1016×640 圖面 1.87 ms、全螢幕 fill 1.83 ms、分欄 numpy 0.09 ms、序列快照 `np.array` 2.5 ms、LRA（含排序）4.8 ms。最直覺的寫法（20 FPS、每幀重畫）會多吃約 8% CPU；5 FPS 不快取預期把這個畫面壓到約 30%（現行分布圖畫面 47 ~ 53%、Loudness 畫面 59.6%）。GIL 最長單次持有約 4 ms，遠低於實測會造成溢位的約 33 ms；音訊 callback 完全不動。
+
+**順帶查到（現行系統，非本次改動造成）**：
+- **記憶體約每小時 +7 MB**：兩次 `smaps` 對照（相隔 108 秒）總 RSS +5.2 MB，**全部在主 `[heap]`（123.7 → 128.9 MB），Rust／計算執行緒所在的 arena 維持 9.2 MB 不動**——不是 Rust `EnergyStore`，符合 `surf_cache`（以顯示數字為 key 的大 Surface 快取，沒有上限）的特徵：畫面上每出現一個新的數字就多幾個快取，PM5D 電平變動時長得快。推估有上限（數值約 71 種整數 × 各格快取，主 heap 約 150 MB），舊版同機制；要不要替快取設上限另案
+- **16:55 一次溢位**（第一個 process 連跑 5 小時只有這 1 次）：時間上與我在 Pi 上跑量測腳本吻合，很可能是它造成。**教訓：在 Pi 上量測本身會擾動音訊，做正式監測時 Pi 上不能同時跑其他東西**
+
+**更正**：EBU Tech 3342 V4 文件史記載「2011-08 V2：Relative gate changed from −8 to −10 LU」，−8 是 2011 年前的舊規範值——見 09-18 章節的更正。commit `ab41370` 的訊息（寫「−8 是 2026-03-27 的錄入錯誤」）不 amend，以此處與程式碼註解為準。
+
+**部署**：舊版（第一輪 Rust ＋ 分布圖）備份在 Pi 的 `~/loudness_meter/loudness_meter.py.bak_20260919_v1`；第一個 process 的完整 log 在 `~/lm_run1_20260919.log`。
+
+**監測結果**（Pi 時間 18:00–19:00 整點小時；畫面全程停在 Histogram 整點版、期間沒有任何切畫面事件、PM5D 訊號持續；另從 17:22 起多量了整點前的資料）：
+
+| | Loudness 畫面（第一輪 12:00–13:00） | 舊分布圖畫面 | **時間軸畫面（本次）** |
+|---|---|---|---|
+| 溢位（評估小時內） | 0 | — | **0** |
+| CPU 平均 | 59.6% | 47 ~ 53% | **38.7%**（隨圖長滿由 35.6% 緩升到 40.9%；最小 28.3%、最大 43.6%） |
+| 主執行緒 CPU | 38.8% | 約 30%（推算） | 約 7% → 14%（`top -H`，6 秒視窗有雜訊） |
+| RSS | 253 → 260 MB（+7.3） | — | 252.1 → 254.6 MB（**+2.5 MB／小時**） |
+| 溫度 | 平均 55°C | — | 平均 51.5°C、最高 53.0°C，降頻旗標全程 `0x0` |
+
+- **計畫門檻全部通過**：溢位 0、CPU 平均 ≤ 45%（且比 Loudness 畫面低約 21 個百分點）、RSS < 350 MB 且 Rust／計算執行緒 arena 不成長、溫度 ≤ 60°C 無降頻、行程全程存活且 log 無 Traceback、無非預期切畫面、18:00 與 19:00 兩次整點歸零都正常（截圖確認）
+- **預估（約 30%）低估了**：整點版的圖隨時間長滿，要畫的長條由幾十根增加到 508 根，加上每秒的序列快照與 LRA 排序、Rust `compute_h` 隨累積量成長，CPU 由 35.6% 緩升到 40.9%。實測比預估高約 9 個百分點，仍遠低於 Loudness 畫面
+- **記憶體**：`smaps` 起點（18:03）與終點（19:03）對照，總 RSS +2.5 MB，主 `[heap]` 91.9 → 93.8 MB，其餘區段（含 Rust／計算執行緒 arena 6.1 MB）一動不動，印證第一輪查出的判斷：成長在 `surf_cache`，不是洩漏；訊號穩定時幾乎不長
+- **整段運轉（17:18 啟動 → 19:04，1 小時 46 分）只有 1 次溢位，發生在 17:34，不在評估區間內**——原因不明。CSV 顯示 17:32:50 起記憶體在 70 秒內階躍約 +3 MB（訊號電平變動，畫面上大量出現新的數字快取），溢位發生在其後約 1 分鐘。假設是「每個新數字第一次渲染」（`render_outlined` 16 方向描邊加 `smoothscale`，估計數十毫秒、期間持有 GIL）擋住了 audio callback，**未驗證**。頻率約每 106 分鐘 1 次，比舊版每小時約 820 次低三個數量級；若日後需要壓到 0，方向是縮小這段渲染的 GIL 持有時間，或降低新字串出現的頻率（例如 LRA 改顯示整數）
+
+## 2026-09-19：Rust `EnergyStore` 接管 H / SEG ＋ LUFS Histogram 上線（第一輪）
 
 **做了什麼**：① `lufs_core` 升到 0.2.0，新增 `EnergyStore`（block 能量由 Rust 保管）；② `loudness_meter.py` 改用它算 THIS HOUR / SEGMENT，並把 relative gate 修正成 −10；③ 新增 LUFS Histogram 畫面（整點累積／滑動 3 分鐘）。同日部署上 Pi（PID 222768 起）。
 
@@ -31,7 +218,7 @@
 
 使用者選定修正。新增 `RELATIVE_GATE_LU = 10.0` 常數，H / SEG 都吃它。**這是正確性修正、會改變顯示值**：一般節目幾乎不變，大動態範圍內容（古典樂／紀錄片）THIS HOUR / SEGMENT 會比之前低最多約 0.46 LU（−10 的閾值比 −8 低，多納入一些較安靜的 block，平均自然略低）。−8 的來龍去脈見下一節（09-18）。
 
-### 決策 3：Histogram 的設計選擇
+### 決策 3：Histogram 的設計選擇（**分布圖版，已被上面第二輪的時間軸版取代，保留作紀錄**）
 
 - **統計來源**：`compute_loop` 每 0.1 秒算出的 S（3 秒 short-term）。窗口填滿前不投票——那時 S = −70 代表「沒資料」，不是「靜音」。
 - **內部解析度 0.1 LU、801 格**（第 0 格 =「≤ −70 LUFS」即低於絕對閾值，第 1..800 格 = −70..+10 LUFS），畫面聚合成 41 根（−50..−10，每根 1 LU）。不直接用 1 LU 分桶：P10 / P95 誤差會到 ±0.5 LU，LRA 可能差到 1 LU。0.1 LU 是 libebur128 同款，誤差 ≤ 0.05 LU；實測對照精確解（不分桶、直接對原始值算）LRA 只差 0.03 LU。
@@ -89,7 +276,7 @@
 
 **動機**：09-12 那次修完 log 風暴與 H/SEG 降頻後，殘餘 3.2% 音訊損失的根因是結構性的（Python GIL，`np.array(list)` 持有 GIL 且成本隨小時累積線性成長）。降頻率只能壓低、消不乾淨，長期方向是 Rust 接管計算、Python 只管畫面。今天先打通管線：只移植 `compute_h()`，其餘（K-weighting／FFT／音訊 I/O）留待之後。
 
-**查證：官方 relative gate 是 −10 LU，現有 Python 版的 `-8.0` 是錯的**——直接讀取 ITU-R BS.1770-5（2023 現行版）官方 PDF 原文確認：「the second at −10 dB relative to the level measured after application of the first threshold」，此值從 BS.1770-2（2011）引入後從未變過。−8 從來不是任何一版官方數值。**這是獨立於 Rust 移植之外的正確性 bug**，`loudness_meter.py` 目前跑在 Pi 上用的就是 -8——要不要修 Python 正式版，等使用者決定。Rust 版把這個值做成參數（`relative_gate_lu`，預設 10.0），方便對照腳本同時驗證兩個值。
+**查證：官方 relative gate 是 −10 LU，現有 Python 版的 `-8.0` 是錯的**——直接讀取 ITU-R BS.1770-5（2023 現行版）官方 PDF 原文確認：「the second at −10 dB relative to the level measured after application of the first threshold」，此值從 BS.1770-2（2011）引入後從未變過。~~−8 從來不是任何一版官方數值。~~ **【09-19 更正】這句寫錯了**：EBU Tech 3342 V4（2023-11）的文件史記載「August 2011 V2; Relative gate changed from −8 to −10 LU」——**−8 是 2011 年前的舊規範值**，並非錄入錯誤或憑空的數字；3 月手寫 `compute_h()` 為什麼用 −8，commit 沒留來源，無從得知。−10 的決定不變（BS.1770-5、R128、Tech 3342 現行版都是 −10）。**這是獨立於 Rust 移植之外的正確性問題**，`loudness_meter.py` 目前跑在 Pi 上用的就是 -8——要不要修 Python 正式版，等使用者決定。Rust 版把這個值做成參數（`relative_gate_lu`，預設 10.0），方便對照腳本同時驗證兩個值。
 
 **產出**：`lufs_core/`（PyO3 + maturin，`abi3-py38`），`compute_h()` 逐行對應移植；`test_compute_h.py`（四組合成資料：全靜音／單一爆音／正常分布／邊界附近，斷言 Python 版與 Rust 版差 < 1e-9）全數通過（diff 0 或 3.55e-15）；交叉編譯出 `lufs_core-0.1.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl`（410KB .so），尚未上機測試。
 

@@ -11,9 +11,8 @@ fn energy_to_lufs(e: f64) -> f64 {
 ///
 /// `relative_gate_lu`：相對閾值的 LU 數。ITU-R BS.1770-5 Annex 1 官方值是 10.0——
 /// 「the second at −10 dB relative to the level measured after application of
-/// the first threshold」。舊 Python 版 compute_h() 誤植成 8.0（2026-09-19 已在
-/// loudness_meter.py 改為 10.0，見 implementation-notes.md），這裡保留成參數而不寫死，
-/// 讓對照腳本能同時驗證兩個值。
+/// the first threshold」。8.0 是 2011 年前的舊規範值（歷史見 implementation-notes.md），
+/// 這裡保留成參數而不寫死，讓對照腳本能同時驗證兩個值。
 fn gated_lufs(block_energies: &[[f64; 2]], relative_gate_lu: f64) -> f64 {
     if block_energies.len() < 2 {
         return -70.0;

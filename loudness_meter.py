@@ -2,10 +2,10 @@ import numpy as np
 import sounddevice as sd
 import pygame
 import sys
-import subprocess
 import threading
 import collections
 import datetime
+import math
 import time
 import os
 import signal
@@ -17,44 +17,48 @@ from lufs_core import EnergyStore   # Rust 擴充模組（lufs_core/），保管
 SAMPLE_RATE = 48000
 CHANNELS    = 2
 
-def _setup_scarlett():
-    """
-    Auto-detect Focusrite Scarlett. If not found, list all input devices and
-    prompt the user to select one.
-    """
-    devices = sd.query_devices()
-
-    # 優先自動偵測 Scarlett / Focusrite
-    scarlett_idx = next(
-        (i for i, d in enumerate(devices)
-         if ('scarlett' in d['name'].lower() or 'focusrite' in d['name'].lower())
-         and d['max_input_channels'] > 0),
-        None
-    )
-    if scarlett_idx is not None:
-        print(f"Scarlett detected: [{scarlett_idx}] {devices[scarlett_idx]['name']}")
-        return scarlett_idx
-
-    # 找不到 Scarlett → 列出所有可用輸入裝置
-    input_devices = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
-    if not input_devices:
-        print("ERROR: No input devices found.")
+def select_input_device(devices, want="", interactive=False):
+    """選音訊輸入裝置，回傳 sounddevice 的裝置編號：
+    1. want（環境變數 LM_AUDIO_DEVICE，裝置名稱的一部分、不分大小寫）——換別台介面時用
+    2. 沒設或找不到：Scarlett / Focusrite
+    3. 都沒有：interactive（有鍵盤）才列清單詢問；否則（開機自動啟動）自動選第一個 ≥ 2 聲道的輸入裝置。
+       以前這裡一律 input()，開機自動啟動時沒有 stdin → EOFError 被吃掉、無限迴圈卡死
+    一個輸入裝置都沒有就結束程式（不要卡住）。"""
+    inputs = [(i, d) for i, d in enumerate(devices) if d['max_input_channels'] > 0]
+    if not inputs:
+        print("ERROR: No input devices found.", flush=True)
         sys.exit(1)
 
-    print("Scarlett not found. Available input devices:")
-    for n, (i, d) in enumerate(input_devices, 1):
-        print(f"  {n}. {d['name']}  (ch: {d['max_input_channels']})")
+    keys = ([want.lower()] if want else []) + ["scarlett", "focusrite"]
+    for key in keys:
+        for i, d in inputs:
+            if key in d['name'].lower():
+                print(f"Audio input: [{i}] {d['name']}" + (f"  (LM_AUDIO_DEVICE={want})" if key == want.lower() else ""), flush=True)
+                return i
+    if want:
+        print(f"WARNING: LM_AUDIO_DEVICE={want!r} not found", flush=True)
 
+    if not interactive:
+        i, d = next(((i, d) for i, d in inputs if d['max_input_channels'] >= CHANNELS), inputs[0])
+        print(f"Scarlett not found, no keyboard (autostart): using [{i}] {d['name']}"
+              f"  — set LM_AUDIO_DEVICE to choose another", flush=True)
+        return i
+
+    print("Scarlett not found. Available input devices:")
+    for n, (i, d) in enumerate(inputs, 1):
+        print(f"  {n}. {d['name']}  (ch: {d['max_input_channels']})")
     while True:
         try:
-            choice = int(input(f"Select device [1-{len(input_devices)}]: "))
-            if 1 <= choice <= len(input_devices):
-                idx, dev = input_devices[choice - 1]
-                print(f"Using: [{idx}] {dev['name']}")
-                return idx
-        except (ValueError, EOFError):
-            pass
-        print(f"  Please enter a number between 1 and {len(input_devices)}.")
+            choice = int(input(f"Select device [1-{len(inputs)}]: "))
+        except ValueError:
+            choice = 0
+        except EOFError:                 # Ctrl-D：使用者不選了
+            sys.exit(1)
+        if 1 <= choice <= len(inputs):
+            i, d = inputs[choice - 1]
+            print(f"Using: [{i}] {d['name']}")
+            return i
+        print(f"  Please enter a number between 1 and {len(inputs)}.")
 
 BLOCK_SIZE  = 2400          # 50ms per block
 
@@ -62,15 +66,17 @@ TARGET_LUFS      = -23.0
 BLUE_THRESHOLD   = -30.0
 YELLOW_THRESHOLD = -23.0
 RED_THRESHOLD    = -10.0
-FPS              = 20
+FPS              = 20   # Spectrum 畫面；peak hold 兩個常數由它推導，改它要一起看
+# 各畫面幀率。Loudness 的 M / S 每秒只算 10 次，20 FPS 有一半的幀在重畫同樣的東西
+# （2026-10-03 實測：主執行緒 39.1% 幾乎全是渲染）；Histogram 的資料每秒才變一次。
+_SCREEN_FPS = {"loudness": 10, "spectrum": FPS, "histogram": 5}
 
 # 窗口長度以「幾個 block」表示（BLOCK_SIZE = 50ms），直接決定 deque 的 maxlen
 M_BLOCKS = 8    # 瞬時窗口 400ms
 S_BLOCKS = 60   # 短期窗口 3s
 
-# H / SEG 的相對閾值：ITU-R BS.1770-5 Annex 1 官方值是「絕對閾值篩選後平均再 −10 LU」。
-# 2026-09-19 前這裡誤植成 −8（2026-03-27 手寫 compute_h() 取代 pyloudnorm 時的錄入錯誤），
-# 大動態範圍內容的 H 因此偏高最多約 0.46 LU，見 implementation-notes.md。
+# H / SEG 的相對閾值：ITU-R BS.1770-5 Annex 1 官方值，絕對閾值篩選後的平均再 −10 LU。
+# （2026-09-19 前是 −8，那是 2011 年前的舊規範值；歷史與影響見 implementation-notes.md）
 RELATIVE_GATE_LU = 10.0
 
 # ─── GPIO（Spectrum Analyzer 觸發，訊源 Yamaha PM5D GPI OUT，UNLATCH 瞬時脈衝） ──
@@ -94,7 +100,7 @@ _SPECTRUM_FRAC_MID   = 0.70   # -40..-20 佔畫面高度比例（訊號常駐區
 # 頂端 -20..0 自動是剩下的 1 - FRAC_LOW - FRAC_MID = 0.15
 _SPECTRUM_DBFS_TICKS = [0, -20, -30, -40, -70]
 
-_PEAK_HOLD_SEC        = 1.0    # peak 頂住不落下的時間（秒），上機用眼睛調
+_PEAK_HOLD_SEC        = 3.0    # peak 頂住不落下的時間（秒）。8/15 上機定 1 秒，2026-10-09 使用者改 3 秒
 _PEAK_HOLD_FRAMES     = int(round(_PEAK_HOLD_SEC * FPS))
 _PEAK_DECAY_PER_SEC   = 12.0   # 頂住時間過後的回落速度（dB/秒），上機用眼睛調
 _PEAK_DECAY_PER_FRAME = _PEAK_DECAY_PER_SEC / FPS   # 假設穩定 FPS，不用另外量測 dt
@@ -174,7 +180,7 @@ _running        = True
 
 display_mode = "loudness"   # "loudness" / "spectrum" / "histogram" — GPIO 畫面切換鈕控制
 freq_index   = 0            # 目前選定/反白的頻段索引，純顯示用（BAND dBFS／BAND FREQ）
-dist_mode    = "hour"       # histogram 畫面的統計範圍："hour" 整點累積 / "slide" 滑動 3 分鐘（KEY10/11 切換）
+hist_mode    = "hour"       # histogram 畫面的範圍："hour" 整點起 0~60 分 / "slide" 最近 10 分鐘（KEY10/11 切換）
 
 # Peak hold：每個頻段一格，只在原地用索引更新內容，不重新賦值整個 list，不用 global。
 _spectrum_peaks     = [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS)
@@ -182,9 +188,6 @@ _spectrum_peak_hold = [0] * len(OCTAVE_BANDS)   # 每個頻段「還要再頂住
 
 prev_H   = None   # last completed hour's LUFS（整點 rollover 時更新）
 prev_SEG = None   # last 3-min fixed segment's LUFS（每 3 分鐘快照）
-
-st_history  = collections.deque(maxlen=20)  # SHORT TERM 每 3 秒快照
-seg_history = collections.deque(maxlen=20)  # SEGMENT 每 3 分鐘快照
 
 
 # ─── Audio processing ─────────────────────────────────────────────────────────
@@ -208,86 +211,67 @@ def k_weight_and_energy(audio):
     return energies
 
 
-# ─── LUFS Histogram（響度分布；S 每 0.1 秒投一票，記票式累加） ───────────────────
-# 內部解析度 0.1 LU（libebur128 同款），P10/P95 誤差 ≤ 0.05 LU。
-# 第 0 格 =「≤ -70 LUFS」（低於絕對閾值：不參與 LRA、畫面上併入最左根），第 1..800 格 = -70..+10 LUFS。
-_DIST_PER_LU    = 10
-_DIST_N         = 801
-_DIST_BAR_LO    = -50      # 畫面最左根的中心 LUFS；41 根、每根 1 LU → -50..-10
-_DIST_N_BARS    = 41
-_DIST_BAR_BIN0  = 1 + round((_DIST_BAR_LO - 0.5 + 70.0) * _DIST_PER_LU)   # 最左根對應的第一個內部格（=196）
-_DIST_SLIDE_SEC = 180.0    # 滑動版窗口，對齊 SEGMENT (3')
-_DIST_MIN_N     = 600      # 有效票數 < 60 秒份不算 LRA（剛清零時的數字沒有意義）
-_DIST_FRAC_LO   = 1e-5     # Y 軸（對數）底端 = 0.001%
-
-_DIST_CENTERS = -70.0 + (np.arange(_DIST_N) - 0.5) / _DIST_PER_LU   # 第 i 格的中心 LUFS（第 0 格不使用）
-_DIST_ENERGY  = 10.0 ** ((_DIST_CENTERS + 0.691) / 10.0)            # 對應能量，算相對閾值用
-
-_dist_hour      = np.zeros(_DIST_N, dtype=np.int64)   # 整點累積，整點清零
-_dist_slide     = np.zeros(_DIST_N, dtype=np.int64)   # 滑動 3 分鐘
-_dist_slide_q   = collections.deque()                 # (時間, 格號)，票過期時據此退票
-_dist_hour_seen = current_hour
+# ─── LUFS Histogram（響度歷史圖：X = 時間、Y = 響度；S 每秒取樣一筆） ─────────────────
+# (time.time(), S)。只在 S 窗口填滿時寫入——時間上的空缺本來就是圖上的空缺，不需要 NaN。
+# compute_loop 的 1Hz 區塊實際約每 1.14 秒一次，一小時約 3200 筆，容量 4000 夠用。
+# 滑動版：60 根 × 3 秒 = 3 分鐘。一根剛好是一個 Short Term 窗口長度、前後不重疊；
+# 整個畫面對齊 SEGMENT (3')。
+_TL_SLIDE_BIN = 3.0
+_TL_SLIDE_N   = 60
+_TL_SLIDE_MIN = 3
+_TL_MIN_N     = 60                     # 過閘後樣本 < 60 筆（約 1 分鐘）不算 LRA，剛清零時的數字沒有意義
+_tl_q         = collections.deque(maxlen=4000)
+_tl_memo      = {"key": None, "val": None}   # 快照與 LRA 只在有新樣本時重算，每秒一次
 
 
-def _dist_bin(s):
-    if s <= -70.0:
-        return 0
-    return min(_DIST_N - 1, 1 + int((s + 70.0) * _DIST_PER_LU))
-
-
-def _dist_feed(s):
-    """compute_loop 每 0.1 秒呼叫一次，投一票。整點版：+1，整點清零。滑動版：新票 +1、
-    過期票 -1（進出帳）。
-    ponytail: 滑動版不要「每幀把窗口內的值重掃分桶」——那是 O(n) 全量重算，就是 compute_h
-    當年造成每小時週期性掉音訊的同一個錯誤。過期用時間判斷（不是固定票數），因為
-    compute_loop 實際頻率略低於 10Hz，固定 1800 票會變成 3 分 20 秒。"""
-    global _dist_hour_seen
-    idx = _dist_bin(s)
-    now = time.monotonic()
+def _tl_feed(s):
     with lock:
-        if current_hour != _dist_hour_seen:      # 整點：清空整點累積
-            _dist_hour[:] = 0
-            _dist_hour_seen = current_hour
-        _dist_hour[idx]  += 1
-        _dist_slide[idx] += 1
-        _dist_slide_q.append((now, idx))
-        while now - _dist_slide_q[0][0] > _DIST_SLIDE_SEC:
-            _dist_slide[_dist_slide_q.popleft()[1]] -= 1
+        _tl_q.append((time.time(), s))
 
 
-def _dist_snapshot(mode):
+def tl_lra(s):
+    """EBU Tech 3342：絕對閾值 -70 → 相對閾值（過閾值樣本的平均能量再 -20 LU）→ P95 - P10。
+    樣本不足回 None。相對閾值的基準是「這批 short-term 值自己的平均」，不是 H。"""
+    s = s[s > -70.0]
+    if len(s) == 0:
+        return None
+    g = s[s > _energy_to_lufs(np.mean(10.0 ** ((s + 0.691) / 10.0))) - 20.0]
+    if len(g) < _TL_MIN_N:
+        return None
+    return float(np.percentile(g, 95) - np.percentile(g, 10))
+
+
+def tl_columns(t, s, t0, span, n):
+    """把 (時間, S) 依時間分進 n 欄，欄內取最大值；沒有樣本的欄是 NaN，視窗外的樣本忽略。"""
+    cols = np.full(n, np.nan)
+    idx  = np.floor((t - t0) / span * n).astype(int)   # 不能只用 astype(int)：它往 0 截，視窗起點之前的樣本會被算進第 0 欄
+    ok   = (idx >= 0) & (idx < n)
+    np.fmax.at(cols, idx[ok], s[ok])
+    return cols
+
+
+def _tl_build(mode, now):
+    """整點版：視窗 = 本整點起 3600 秒（整點一過視窗自然移走，不需要清零邏輯）；滑動版：最近
+    60 根 × 3 秒，起點對齊 3 秒整數倍、最右一根是正在累積的這 3 秒。不對齊的話（例如用 now - 180），
+    視窗每幀平移，同一筆樣本會在相鄰兩根之間跳來跳去，畫面會閃。回傳 (t0, span, t, s, lra)。"""
+    if mode == "hour":
+        t0, span = datetime.datetime.fromtimestamp(now).replace(minute=0, second=0, microsecond=0).timestamp(), 3600.0
+    else:
+        t0   = (now // _TL_SLIDE_BIN - (_TL_SLIDE_N - 1)) * _TL_SLIDE_BIN
+        span = _TL_SLIDE_N * _TL_SLIDE_BIN
     with lock:
-        return (_dist_hour if mode == "hour" else _dist_slide).copy()
+        arr = np.array(_tl_q).reshape(-1, 2)   # n ≤ 4000，Pi 約 2.5ms
+    keep = arr[:, 0] >= t0
+    t, s = arr[keep, 0], arr[keep, 1]
+    return t0, span, t, s, tl_lra(s)
 
 
-def dist_bars(counts):
-    """801 個內部格 → 畫面 41 根（每根 1 LU，中心在整數 LUFS）。超出範圍的併入邊緣根，
-    「低於閾值」格也併進最左根。"""
-    b0   = _DIST_BAR_BIN0
-    bars = counts[b0:b0 + _DIST_N_BARS * _DIST_PER_LU].reshape(_DIST_N_BARS, _DIST_PER_LU).sum(axis=1)
-    bars[0]  += counts[:b0].sum()
-    bars[-1] += counts[b0 + _DIST_N_BARS * _DIST_PER_LU:].sum()
-    return bars
-
-
-def dist_lra(counts):
-    """EBU Tech 3342：絕對閾值（-70，即排除第 0 格）→ 相對閾值（過閾值票的平均能量再 -20 LU）
-    → P10 / P95。回傳 (LRA, P10, P95)；票數不足回 None。
-    相對閾值的基準是「這批 short-term 值自己的平均」，不是 H——舊版（2026-03-27 被刪掉的
-    compute_lra）用的是 integrated_lufs - 20，跟 Tech 3342 的定義不同。"""
-    c  = counts[1:].astype(np.float64)
-    n1 = c.sum()
-    if n1 == 0:
-        return None
-    rel = _energy_to_lufs((c * _DIST_ENERGY[1:]).sum() / n1) - 20.0
-    c[_DIST_CENTERS[1:] <= rel] = 0
-    n2 = c.sum()
-    if n2 < _DIST_MIN_N:
-        return None
-    cdf = np.cumsum(c)
-    p10 = _DIST_CENTERS[1 + int(np.searchsorted(cdf, 0.10 * n2))]
-    p95 = _DIST_CENTERS[1 + int(np.searchsorted(cdf, 0.95 * n2))]
-    return p95 - p10, p10, p95
+def tl_snapshot(mode):
+    with lock:
+        last = _tl_q[-1][0] if _tl_q else 0.0
+    if _tl_memo["key"] != (mode, last):
+        _tl_memo["key"], _tl_memo["val"] = (mode, last), _tl_build(mode, time.time())
+    return _tl_memo["val"]
 
 
 def audio_callback(indata, frames, time_info, status):
@@ -367,7 +351,6 @@ def compute_loop():
                 sig = lfilter(_RLB_B, _RLB_A, sig)
                 e_total += float(np.mean(sig ** 2))
             S = _energy_to_lufs(e_total) if e_total > 1e-12 else -70.0
-            _dist_feed(S)   # 窗口還沒填滿 3 秒前的 S 是「沒資料」不是「靜音」，所以只在這裡投票
 
         with lock:
             latest["M"] = M
@@ -380,30 +363,111 @@ def compute_loop():
             with lock:
                 latest["H"]   = H
                 latest["SEG"] = SEG
+            if len(s_snap) >= S_BLOCKS:   # 窗口沒填滿 3 秒前的 S 是「沒資料」不是「靜音」，不進歷史圖
+                _tl_feed(S)
 
 
 # ─── GUI ──────────────────────────────────────────────────────────────────────
+_DIRS16 = [(math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)) for i in range(16)]
+
+
+def _outline_layer(font, text, offset, outline_color=(0, 0, 0)):
+    """黑色外框層：同一段文字往 16 個方向各蓋一次（雙半徑填補缺口），尺寸 = 文字 + 四周 offset。"""
+    shadow = font.render(text, True, outline_color)
+    surf   = pygame.Surface((shadow.get_width() + offset * 2, shadow.get_height() + offset * 2), pygame.SRCALPHA)
+    for r in [offset, max(1, round(offset * 0.6))]:
+        for dx, dy in _DIRS16:
+            surf.blit(shadow, (round(dx * r) + offset, round(dy * r) + offset))
+    return surf
+
+
 def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
     """2 層渲染：黑色外框（16 方向均勻擴展）→ 主色填充。
-    模擬 Photoshop 筆畫「外部」效果：白色主體大小不變，黑框只往外延伸。"""
-    import math
-    dirs16 = [(math.cos(i * math.pi / 8), math.sin(i * math.pi / 8)) for i in range(16)]
-
-    shadow_surf = font.render(text, True, outline_color)
-    color_surf  = font.render(text, True, color)
-
-    w = color_surf.get_width()  + offset * 2
-    h = color_surf.get_height() + offset * 2
-    surf = pygame.Surface((w, h), pygame.SRCALPHA)
-
-    # 第一層：黑色外框，16 方向往外擴展（雙半徑填補缺口）
-    for r in [offset, max(1, round(offset * 0.6))]:
-        for dx, dy in dirs16:
-            surf.blit(shadow_surf, (round(dx * r) + offset, round(dy * r) + offset))
-
-    # 第二層：白色主體，正中心疊上，大小不變
-    surf.blit(color_surf, (offset, offset))
+    模擬 Photoshop 筆畫「外部」效果：主體大小不變，黑框只往外延伸。現在只用在軸文字（字串固定、張數有限）。"""
+    surf = _outline_layer(font, text, offset, outline_color)
+    surf.blit(font.render(text, True, color), (offset, offset))
     return surf
+
+
+# ─── 大數字：單一字元快取（2026-10-09，C 方案） ─────────────────────────────────
+# 舊做法以「整個字串」快取畫好的大數字：沒見過的字串（-24、L -33、LRA 4.7……）要現場畫——16 方向描邊加縮放，
+# 數十毫秒、持有 GIL，音訊 callback 被擋住就 input overflow。實測 5 天 21 小時 7 次溢位，全部落在快取剛長的
+# 10 分鐘區間（快取沒長的 799 個區間 0 次），快取也一路長到 688 張 / 94 MB。
+# 改成每個字元（各字級各色）只畫一次、開機預熱（warm_glyph_cache），顯示時逐字拼：張數固定、執行中不再現場畫。
+_GLYPH_CHARS   = "0123456789-. LRA"           # LUFS、L/R、LRA 小數、頻率（含 ALL）、變化量用到的全部字元
+_NUM_PALETTE   = ((255, 255, 255), (220, 50, 50), (220, 200, 50), (50, 200, 80), (50, 130, 220))  # 白 ＋ lufs_to_color 四色
+_WHITE_ONLY    = ((255, 255, 255),)
+_DELTA_PALETTE = ((220, 50, 50), (110, 200, 110), (140, 140, 140))
+# 每格的縮放比以「這格可能出現的最寬字串」決定、整格固定——字大小不會隨位數忽大忽小
+_LUFS_REFS = ("-70", "---")
+_LRA_REFS  = ("40.0", "---")
+_FREQ_REFS = ("31.5", "12.5", "1.25", "800", "ALL")
+
+
+def _glyph_set(cache, font, offset, sc, palette):
+    """某字級（字型 × 描邊 × 縮放比）的整套字元：每字元一張描邊層、調色盤每色一張本體層，第一次用到時一次畫完。"""
+    key = ('glyphs', id(font), offset, sc, palette)
+    gs  = cache.get(key)
+    if gs is None:
+        gs = {}
+        for ch in _GLYPH_CHARS:
+            outline = _outline_layer(font, ch, offset)
+            size    = (max(1, round(outline.get_width() * sc)), max(1, round(outline.get_height() * sc)))
+            gs[ch, None] = outline if sc == 1 else pygame.transform.smoothscale(outline, size)
+            for col in palette:
+                body = pygame.Surface(outline.get_size(), pygame.SRCALPHA)
+                body.blit(font.render(ch, True, col), (offset, offset))
+                gs[ch, col] = body if sc == 1 else pygame.transform.smoothscale(body, size)
+        cache[key] = gs
+    return gs
+
+
+def _fit_scale(font, refs, offset, box_w, box_h):
+    w = max(font.size(s)[0] for s in refs) + offset * 2
+    h = font.get_height() + offset * 2
+    return min(box_w / w, box_h / h)
+
+
+_TEXT_LRU_MAX = 48   # 拼好的整串字：畫面上同時只有十來個數字，48 張足夠讓穩定的讀值都命中
+
+
+def _compose_text(gs, font, text, color, offset, sc, palette):
+    """用已畫好的字元拼成一整張圖。字距照整串渲染的量測（font.size(前綴)），排版跟以前整串 render 一致。
+    先畫完所有字的描邊、再畫所有本體——描邊往外擴，若一字一字各自畫完，下一字的描邊會蓋到上一字的本體。
+    字元集外或顏色不在調色盤時略過／退回白色，不讓繪圖迴圈崩潰。"""
+    w, h = font.size(text)
+    surf = pygame.Surface((max(1, round((w + offset * 2) * sc)), max(1, round((h + offset * 2) * sc))), pygame.SRCALPHA)
+    xs   = [round(font.size(text[:i])[0] * sc) for i in range(len(text))]
+    for layer in (None, color):
+        for x, ch in zip(xs, text):
+            g = gs.get((ch, layer))
+            if g is None and layer is not None:
+                g = gs.get((ch, palette[0]))
+            if g is not None:
+                surf.blit(g, (x, 0))
+    return surf
+
+
+def draw_glyph_text(surface, cache, font, text, color, offset, sc, palette, cx, cy):
+    """以 (cx, cy) 為中心畫一串字，回傳 (左, 上, 寬, 高)。兩層快取：
+    1. 字元層（_glyph_set）：每個字元各色只畫一次、開機預熱、張數固定——昂貴的描邊＋縮放只發生在這裡
+    2. 整串層（有上限的 LRU）：每幀只貼一張圖。逐字直接貼到畫面的話，每個字的描邊層四周都有一圈空白、
+       一串要疊 6~8 張半透明圖，實測整張 Loudness 畫面從 7.7 → 16.1 ms/幀，所以多這一層。
+       沒命中時只是用現成字元拼一張（幾次貼圖、約 1~2 ms），不是以前那種數十毫秒的現場描邊縮放。"""
+    lru = cache.setdefault(('text_lru',), collections.OrderedDict())
+    key = (id(font), offset, sc, palette, text, color)
+    s   = lru.get(key)
+    if s is None:
+        s = _compose_text(_glyph_set(cache, font, offset, sc, palette), font, text, color, offset, sc, palette)
+        lru[key] = s
+        if len(lru) > _TEXT_LRU_MAX:
+            lru.popitem(last=False)
+    else:
+        lru.move_to_end(key)
+    w, h   = s.get_size()
+    x0, y0 = cx - w // 2, cy - h // 2
+    surface.blit(s, (x0, y0))
+    return x0, y0, w, h
 
 
 def lufs_to_color(val):
@@ -444,31 +508,7 @@ def _spectrum_y_ratio(val):
         return _SPECTRUM_FRAC_LOW + _SPECTRUM_FRAC_MID + frac_hi * (val - _SPECTRUM_DBFS_SPLIT2) / (_SPECTRUM_DBFS_HI - _SPECTRUM_DBFS_SPLIT2)
 
 
-_HIST_LO  = -41.0   # 歷史色塊高度 0%
-_HIST_REF =   0.0   # 歷史色塊高度 100%（0 LUFS = 滿格）
-
-
-def draw_history_strip(surface, hist_data, zone_x, zone_y, zone_w, zone_h, gap=3):
-    """20格 FIFO 歷史色塊：-23 LUFS 為滿格，暗化閾值色 70% 透明度 + 白色描邊。"""
-    N       = 20
-    n       = len(hist_data)
-    block_w = max(4, (zone_w - gap * (N - 1)) // N)
-    # 單一 SRCALPHA surface 重複使用，避免每格 allocate 一張新的
-    fill_surf = pygame.Surface((block_w, zone_h), pygame.SRCALPHA)
-    for i, lufs_val in enumerate(hist_data):
-        slot  = N - n + i                        # 右對齊
-        bx    = zone_x + slot * (block_w + gap)
-        ratio = min(1.0, max(0.0, (lufs_val - _HIST_LO) / (_HIST_REF - _HIST_LO)))
-        bh    = max(4, int(zone_h * ratio))
-        by    = zone_y + zone_h - bh
-        r, g, b = lufs_to_color(lufs_val)
-        fill_surf.fill((0, 0, 0, 0))
-        fill_surf.fill((r // 2, g // 2, b // 2, 178), (0, zone_h - bh, block_w, bh))
-        surface.blit(fill_surf, (bx, zone_y))
-        pygame.draw.rect(surface, (255, 255, 255), (bx, by, block_w, bh), 2)
-
-
-def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None, history=None):
+def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None):
     font_title, font_scale, font_value, font_lr, *_ = fonts
 
     TITLE_H = 85
@@ -505,52 +545,27 @@ def draw_panel(surface, fonts, surf_cache, title, val, px, pw, ph, lr_vals=None,
 
     # 大數字 — 標準線以上區域，垂直置中
     num_zone_h = ty - BAR_Y
-    val_str    = _fmt_lufs(val)
-    num_key    = ('num_bar', val_str, pw, num_zone_h)
-    if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, (255, 255, 255), offset=34)
-        sc     = min((pw - MARGIN * 2) / vs_raw.get_width(),
-                     (num_zone_h - MARGIN * 2) / vs_raw.get_height())
-        surf_cache[num_key] = pygame.transform.smoothscale(
-            vs_raw, (int(vs_raw.get_width() * sc), int(vs_raw.get_height() * sc)))
-    vs           = surf_cache[num_key]
-    new_w, new_h = vs.get_size()
-    vx           = px + pw // 2 - new_w // 2
-    vy           = BAR_Y + num_zone_h // 2 - new_h // 2
+    sc = _fit_scale(font_value, _LUFS_REFS, 34, pw - MARGIN * 2, num_zone_h - MARGIN * 2)
     surface.set_clip(pygame.Rect(px, BAR_Y, pw, num_zone_h))
-    surface.blit(vs, (vx, vy))
+    draw_glyph_text(surface, surf_cache, font_value, _fmt_lufs(val), (255, 255, 255), 34, sc, _WHITE_ONLY,
+                    px + pw // 2, BAR_Y + num_zone_h // 2)
     surface.set_clip(None)
 
-    # 歷史色塊：頂端對齊 -23 LUFS 標準線（ty），滿格頂到標準線
-    if history is not None and len(history) > 0:
-        hist_zone_h = BAR_Y + BAR_H - ty
-        draw_history_strip(surface, history,
-                           BAR_X + 4, ty + 4,
-                           BAR_W - 8, hist_zone_h - 8)
-
-    # L/R — 標準線以下區域，垂直置中，白色，格式 "L -23"
+    # L/R — 標準線以下區域，垂直置中，白色，格式 "L -23"（不縮放，原字級）
     if lr_vals is not None:
-        l_val, r_val = lr_vals
-        l_str = _fmt_lufs(l_val, "L ")
-        r_str = _fmt_lufs(r_val, "R ")
-        for lr_str in (l_str, r_str):
-            lr_key = ('lr', lr_str)
-            if lr_key not in surf_cache:
-                surf_cache[lr_key] = render_outlined(font_lr, lr_str, (255, 255, 255), offset=17)
-        l_surf    = surf_cache[('lr', l_str)]
-        r_surf    = surf_cache[('lr', r_str)]
+        lr_h      = font_lr.get_height() + 17 * 2
         lr_zone_y = ty
         lr_zone_h = BAR_Y + BAR_H - ty
         gap       = 12
-        total_h   = l_surf.get_height() + gap + r_surf.get_height()
-        lr_start  = lr_zone_y + lr_zone_h // 2 - total_h // 2
+        lr_start  = lr_zone_y + lr_zone_h // 2 - (lr_h * 2 + gap) // 2
         surface.set_clip(pygame.Rect(BAR_X, lr_zone_y, BAR_W, lr_zone_h))
-        surface.blit(l_surf, (px + pw // 2 - l_surf.get_width() // 2, lr_start))
-        surface.blit(r_surf, (px + pw // 2 - r_surf.get_width() // 2, lr_start + l_surf.get_height() + gap))
+        for k, (prefix, v) in enumerate(zip(("L ", "R "), lr_vals)):
+            draw_glyph_text(surface, surf_cache, font_lr, _fmt_lufs(v, prefix), (255, 255, 255), 17, 1, _WHITE_ONLY,
+                            px + pw // 2, lr_start + k * (lr_h + gap) + lr_h // 2)
         surface.set_clip(None)
 
 
-def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, history=None, delta_align='below', num_color=(255, 255, 255), val_str=None):
+def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, ph, delta=None, delta_align='below', num_color=(255, 255, 255), val_str=None, ref_strs=_LUFS_REFS):
     font_title, _, font_value, font_lr, font_delta = fonts
 
     TITLE_H        = 70
@@ -558,54 +573,28 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
     OUTLINE_OFFSET = max(4, round(34 * _pscale))
     MARGIN         = 10
 
-    if history is not None and len(history) > 0:
-        pygame.draw.rect(surface, (15, 15, 15), (px, py, pw, ph))
-        draw_history_strip(surface, history, px + 6, py + 6, pw - 12, ph - 12)
-
     surface.set_clip(pygame.Rect(px, py, pw, ph))
 
-    # title_bg: 80% 不透明暗色背景，讓 title 在歷史色塊上仍可見
-    bg_key = ('title_bg', pw, TITLE_H)
-    if bg_key not in surf_cache:
-        s = pygame.Surface((pw, TITLE_H), pygame.SRCALPHA)
-        s.fill((15, 15, 15, 204))
-        surf_cache[bg_key] = s
-    surface.blit(surf_cache[bg_key], (px, py))
-
-    title_key = ('title', title)
+    title_key = ('title', title, pw)   # 含 pw：draw_panel 也用 ('title', title)，縮小過的版本不能被它拿去用
     if title_key not in surf_cache:
-        surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
+        t = font_title.render(title, True, (170, 170, 170))
+        if t.get_width() > pw - 8:     # 標題比格寬長（例如左欄的 SHORT TERM (3")）就等比縮小
+            t = pygame.transform.smoothscale(t, (pw - 8, max(1, t.get_height() * (pw - 8) // t.get_width())))
+        surf_cache[title_key] = t
     t = surf_cache[title_key]
     surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 10))
 
     num_h   = ph - TITLE_H
     if val_str is None:
         val_str = _fmt_lufs(val)
-    num_key = ('num_panel', val_str, pw, num_h, num_color)
-    if num_key not in surf_cache:
-        vs_raw = render_outlined(font_value, val_str, num_color, offset=OUTLINE_OFFSET)
-        sc_val = min((pw - MARGIN * 2) / vs_raw.get_width(),
-                     (num_h - MARGIN * 2) / vs_raw.get_height())
-        surf_cache[num_key] = (
-            pygame.transform.smoothscale(
-                vs_raw, (int(vs_raw.get_width() * sc_val), int(vs_raw.get_height() * sc_val))),
-            sc_val,
-        )
-    vs, sc = surf_cache[num_key]
-    new_w, new_h = vs.get_size()
-    vx           = px + pw // 2 - new_w // 2
-    vy           = py + TITLE_H + num_h // 2 - new_h // 2
-    surface.blit(vs, (vx, vy))
+    sc = _fit_scale(font_value, ref_strs, OUTLINE_OFFSET, pw - MARGIN * 2, num_h - MARGIN * 2)
+    vx, vy, new_w, new_h = draw_glyph_text(surface, surf_cache, font_value, val_str, num_color, OUTLINE_OFFSET, sc,
+                                           _NUM_PALETTE, px + pw // 2, py + TITLE_H + num_h // 2)
 
     if delta is not None:
         d_str   = str(delta)
         d_color = (220, 50, 50) if delta > 0 else ((110, 200, 110) if delta < 0 else (140, 140, 140))
-        d_key   = ('delta', d_str, d_color)
-        if d_key not in surf_cache:
-            surf_cache[d_key] = render_outlined(font_delta, d_str, d_color, offset=17)
-        ds = surf_cache[d_key]
-
-        delta_half_h = ds.get_height() // 2
+        delta_half_h = (font_delta.get_height() + 17 * 2) // 2
 
         content_left = vx + int(OUTLINE_OFFSET * sc)
         minus_w_sc   = int(font_value.size('-')[0] * sc)
@@ -618,7 +607,7 @@ def draw_number_only_panel(surface, fonts, surf_cache, title, val, px, pw, py, p
             delta_center_y = min(py + ph - delta_half_h - 6,
                                  num_bottom + delta_half_h + 4)
 
-        surface.blit(ds, (delta_x - ds.get_width() // 2, delta_center_y - delta_half_h))
+        draw_glyph_text(surface, surf_cache, font_delta, d_str, d_color, 17, 1, _DELTA_PALETTE, delta_x, delta_center_y)
 
     surface.set_clip(None)
 
@@ -666,6 +655,51 @@ def _update_spectrum_peaks(band_levels):
             _spectrum_peaks[i] = max(v, _spectrum_peaks[i] - _PEAK_DECAY_PER_FRAME)
 
 
+_AXIS_ALPHA = 153   # 軸文字 60% 不透明：字壓在 bar 上時 bar 的顏色透得出來
+
+
+def _axis_label(surf_cache, font, text):
+    """軸文字：灰字＋2px 黑描邊＋60% 透明（整張圖 set_alpha，字與描邊一起變淡）。字串固定、張數有限，照常快取。"""
+    key = ('axis', text)
+    lab = surf_cache.get(key)
+    if lab is None:
+        lab = render_outlined(font, text, (150, 150, 150), offset=2)
+        lab.set_alpha(_AXIS_ALPHA)
+        surf_cache[key] = lab
+    return lab
+
+
+def _draw_dbfs_ticks(surface, surf_cache, font_axis, px, pw, bar_zone_y, bar_zone_h, margin):
+    """Y 軸參考線與兩側刻度文字。Spectrum 與 Histogram 共用同一份——兩張圖跟長條用同一條
+    _spectrum_y_ratio 三段式曲線算位置（中段密、兩端疏），共用才不可能對不齊。
+    最底的 -70 只畫線不印字：圖底本身就代表 -70，而且那個角落要留給 X 軸文字（字大了會疊在一起）。"""
+    bar_area_w = pw - margin * 2
+    for tick in _SPECTRUM_DBFS_TICKS:
+        ty = bar_zone_y + bar_zone_h - int(bar_zone_h * _spectrum_y_ratio(tick))
+        pygame.draw.line(surface, (70, 70, 70), (px + margin, ty), (px + margin + bar_area_w, ty), 1)
+        if tick == _SPECTRUM_DBFS_LO:
+            continue
+        label   = _axis_label(surf_cache, font_axis, str(tick))
+        label_y = max(bar_zone_y, min(bar_zone_y + bar_zone_h - label.get_height(), ty - label.get_height() // 2))
+        surface.blit(label, (px + margin + 2, label_y))
+        surface.blit(label, (px + pw - margin - label.get_width() - 2, label_y))
+
+
+def _draw_vguides(surface, xs, top, bottom):
+    """垂直輔助線（同水平格線的顏色）。要在畫 bar 之前呼叫——被 bar 擋住的部分就看不到，只在 bar 上方露出。"""
+    for x in xs:
+        pygame.draw.line(surface, (70, 70, 70), (x, top), (x, bottom - 1), 1)
+
+
+def _draw_x_labels(surface, surf_cache, font_axis, items, px, pw, bottom, margin):
+    """X 軸文字直接壓在圖底、bar 上面（有描邊與透明度，不另留一列——兩張圖的高度因此完全一致）。
+    items = [(x 中心, 文字)]；頭尾標籤夾在圖框內不出界。"""
+    for x, text in items:
+        lab = _axis_label(surf_cache, font_axis, text)
+        lx  = max(px + margin, min(x - lab.get_width() // 2, px + pw - margin - lab.get_width()))
+        surface.blit(lab, (lx, bottom - lab.get_height() - 2))
+
+
 def draw_spectrum_panel(surface, fonts, surf_cache, band_levels_dbfs, px, pw, py, ph, highlight_index=None, peak_levels=None):
     """全螢幕（扣掉左側資訊欄）1/3 Octave 長條圖，長條區左右兩側都畫 dBFS Y 軸刻度。"""
     font_title, font_scale = fonts[0], fonts[1]
@@ -686,131 +720,153 @@ def draw_spectrum_panel(surface, fonts, surf_cache, band_levels_dbfs, px, pw, py
     bar_area_w = pw - MARGIN * 2
     bar_w      = max(2, (bar_area_w - MARGIN * (n - 1)) // n)
 
+    bottom     = bar_zone_y + bar_zone_h
+    x_center   = [px + MARGIN + i * (bar_w + MARGIN) + bar_w // 2 for i in range(n)]
+    x_labels   = [(x_center[i], text) for i, text in _SPECTRUM_XLABELS if i < n]
+
     pygame.draw.rect(surface, (28, 28, 28), (px + MARGIN, bar_zone_y, bar_area_w, bar_zone_h))
+    _draw_vguides(surface, [x for x, _ in x_labels], bar_zone_y, bottom)
 
     for i, dbfs in enumerate(band_levels_dbfs):
-        bx    = px + MARGIN + i * (bar_w + MARGIN)
-        ratio = _spectrum_y_ratio(dbfs)
-        bh    = int(bar_zone_h * ratio)
-        by    = bar_zone_y + bar_zone_h - bh
-        color = (90, 170, 230) if (highlight_index is not None and i == highlight_index) else (60, 140, 90)
-        pygame.draw.rect(surface, color, (bx, by, bar_w, bh))
+        bx       = px + MARGIN + i * (bar_w + MARGIN)
+        ratio    = _spectrum_y_ratio(dbfs)
+        bh       = int(bar_zone_h * ratio)
+        by       = bottom - bh
+        selected = highlight_index is not None and i == highlight_index
+        pygame.draw.rect(surface, (90, 170, 230) if selected else (60, 140, 90), (bx, by, bar_w, bh))
 
         if peak_levels is not None:
-            peak_ratio = _spectrum_y_ratio(peak_levels[i])
-            peak_y     = bar_zone_y + bar_zone_h - int(bar_zone_h * peak_ratio)
-            pygame.draw.rect(surface, (230, 230, 230), (bx, peak_y - 1, bar_w, 2))
+            peak_y = bottom - int(bar_zone_h * _spectrum_y_ratio(peak_levels[i]))
+            if selected:    # 選定頻段的 peak：黃色加粗，一眼找得到（BYPASS 時 highlight_index 不會落在 0..n-1）
+                pygame.draw.rect(surface, (220, 200, 50), (bx, peak_y - 2, bar_w, 4))
+            else:
+                pygame.draw.rect(surface, (230, 230, 230), (bx, peak_y - 1, bar_w, 2))
 
-    # Y 軸參考：跟長條圖用同一條三段式曲線算位置，刻度間距會跟著曲線走（中段密、兩端疏）
-    for tick in _SPECTRUM_DBFS_TICKS:
-        ty = bar_zone_y + bar_zone_h - int(bar_zone_h * _spectrum_y_ratio(tick))
-        pygame.draw.line(surface, (70, 70, 70), (px + MARGIN, ty), (px + MARGIN + bar_area_w, ty), 1)
-        label_key = ('spectrum_tick', tick)
-        if label_key not in surf_cache:
-            surf_cache[label_key] = font_scale.render(str(tick), True, (150, 150, 150))
-        label = surf_cache[label_key]
-        label_y = max(bar_zone_y, min(bar_zone_y + bar_zone_h - label.get_height(), ty - label.get_height() // 2))
-        surface.blit(label, (px + MARGIN + 2, label_y))
-        surface.blit(label, (px + pw - MARGIN - label.get_width() - 2, label_y))
+    _draw_dbfs_ticks(surface, surf_cache, font_scale, px, pw, bar_zone_y, bar_zone_h, MARGIN)
+    _draw_x_labels(surface, surf_cache, font_scale, x_labels, px, pw, bottom, MARGIN)
 
 
-_DIST_Y_LABELS = [(1.0, "100%"), (0.1, "10%"), (0.01, "1%"), (0.001, "0.1%"), (0.0001, "0.01%")]
-_DIST_X_LABELS = [-50, -40, -30, -23, -20, -10]
+# Spectrum X 軸標示的頻段（使用者指定，非平均分佈；10k 跟 6.3k 只差 2 根、40px 字會疊在一起，所以沒列）
+_SPECTRUM_XLABELS = [(i, f"{fc / 1000:g}k" if fc >= 1000 else f"{fc:g}")
+                     for i, (fc, _, _) in enumerate(OCTAVE_BANDS) if fc in (80, 400, 1000, 6300)]
+
+# X 軸刻度（位置 = 佔視窗的比例，文字）：整點版每 10 分鐘一格；滑動版每 1 分鐘一格（3' / 2' / 1' / now）
+_TL_XTICKS = {
+    "hour":  [(m / 60, str(m)) for m in range(0, 61, 10)],
+    "slide": [((_TL_SLIDE_MIN - m) / _TL_SLIDE_MIN, f"{m}'" if m else "now") for m in range(_TL_SLIDE_MIN, -1, -1)],
+}
 
 
-def _dist_y_ratio(frac):
-    """佔比 → 高度比例，對數刻度：100% 在頂、0.001% 在底，每個十倍一格（共 5 格）。"""
-    if frac <= 0:
-        return 0.0
-    return min(1.0, max(0.0, float(np.log10(frac / _DIST_FRAC_LO) / -np.log10(_DIST_FRAC_LO))))
-
-
-def draw_histogram_panel(surface, fonts, surf_cache, bars, title, px, pw, py, ph):
-    """LUFS 分布長條圖，骨架同 draw_spectrum_panel。X 軸是 LUFS（每根 1 LU），每根用它代表的
-    LUFS 值上色（lufs_to_color），-23 目標線畫成直線；Y 軸是佔比、對數刻度——響度分布集中在
-    目標值附近，線性刻度會看不見兩側尾巴，而爆音與靜音段就藏在尾巴裡。"""
+def draw_histogram_panel(surface, fonts, surf_cache, mode, snap, title, px, pw, py, ph):
+    """時間軸響度歷史圖，骨架同 draw_spectrum_panel。Y 軸與 Spectrum 共用同一條曲線與刻度，長條顏色
+    照 lufs_to_color，-23 目標線畫成水平線。整點版 508 欄 × 2px（≈ 7 秒／欄，相鄰不留縫）；滑動版
+    60 欄 × 約 17px（3 秒／欄，留 2px 縫，一格一格看得出來）。取樣約每 1.14 秒一筆，欄內取最大值。
+    欄邊界用 i * bar_area_w // n 算，寬度除不盡時自然 16 / 17px 交錯，不必湊整除。"""
     font_title, font_scale = fonts[0], fonts[1]
     TITLE_H = 50
     MARGIN  = 4
-    LABEL_H = font_scale.get_height() + 4      # 底部 X 軸刻度文字列
+    t0, span, t, s, _ = snap
 
-    title_key = ('dist_title', title)
+    title_key = ('hist_title', title)
     if title_key not in surf_cache:
         surf_cache[title_key] = font_title.render(title, True, (170, 170, 170))
-    t = surf_cache[title_key]
-    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
+    tt = surf_cache[title_key]
+    surface.blit(tt, (px + pw // 2 - tt.get_width() // 2, py + 8))
 
-    n          = len(bars)
     bar_zone_y = py + TITLE_H
-    bar_zone_h = ph - TITLE_H - MARGIN - LABEL_H
+    bar_zone_h = ph - TITLE_H - MARGIN            # 跟 Spectrum 同高：X 軸文字壓在圖底，不另留一列
     bar_area_w = pw - MARGIN * 2
-    bar_w      = max(2, (bar_area_w - MARGIN * (n - 1)) // n)
+    n, gap     = (bar_area_w // 2, 0) if mode == "hour" else (_TL_SLIDE_N, 2)
+    bottom     = bar_zone_y + bar_zone_h
+    x_ticks    = [(px + MARGIN + int(frac * bar_area_w), text) for frac, text in _TL_XTICKS[mode]]
 
     pygame.draw.rect(surface, (28, 28, 28), (px + MARGIN, bar_zone_y, bar_area_w, bar_zone_h))
+    # 垂直輔助線：頭尾就是圖框不另畫；-1 讓線落在欄邊界前的那條縫裡（滑動版 bar 之間留 2px 縫）
+    _draw_vguides(surface, [x - 1 for x, _ in x_ticks[1:-1]], bar_zone_y, bottom)
 
-    total = int(bars.sum())
-    if total > 0:
-        for k in range(n):
-            if bars[k] == 0:
-                continue
-            bh = max(2, int(bar_zone_h * _dist_y_ratio(bars[k] / total)))   # 有票的根至少 2px，尾巴才看得到
-            bx = px + MARGIN + k * (bar_w + MARGIN)
-            pygame.draw.rect(surface, lufs_to_color(_DIST_BAR_LO + k), (bx, bar_zone_y + bar_zone_h - bh, bar_w, bh))
+    for i, v in enumerate(tl_columns(t, s, t0, span, n)):
+        if v != v:                                  # NaN：這一欄沒有樣本
+            continue
+        bh = int(bar_zone_h * _spectrum_y_ratio(v))
+        if bh > 0:                                  # 低於 -70（靜音）不畫，跟 Spectrum 的底一致
+            x0 = i * bar_area_w // n
+            x1 = (i + 1) * bar_area_w // n
+            pygame.draw.rect(surface, lufs_to_color(v), (px + MARGIN + x0, bottom - bh, x1 - x0 - gap, bh))
 
-    # Y 軸參考線（每個十倍一條）與兩側刻度文字
-    for frac, text in _DIST_Y_LABELS:
-        ty = bar_zone_y + bar_zone_h - int(bar_zone_h * _dist_y_ratio(frac))
-        pygame.draw.line(surface, (70, 70, 70), (px + MARGIN, ty), (px + MARGIN + bar_area_w, ty), 1)
-        label_key = ('dist_ytick', text)
-        if label_key not in surf_cache:
-            surf_cache[label_key] = font_scale.render(text, True, (150, 150, 150))
-        label   = surf_cache[label_key]
-        label_y = max(bar_zone_y, min(bar_zone_y + bar_zone_h - label.get_height(), ty - label.get_height() // 2))
-        surface.blit(label, (px + MARGIN + 2, label_y))
-        surface.blit(label, (px + pw - MARGIN - label.get_width() - 2, label_y))
+    _draw_dbfs_ticks(surface, surf_cache, font_scale, px, pw, bar_zone_y, bar_zone_h, MARGIN)
 
-    # -23 LUFS 目標線：判讀重點就是「分布有沒有騎在目標線上」
-    tx = px + MARGIN + int(round(TARGET_LUFS - _DIST_BAR_LO)) * (bar_w + MARGIN) + bar_w // 2
-    pygame.draw.line(surface, (255, 255, 255), (tx, bar_zone_y), (tx, bar_zone_y + bar_zone_h), 3)
+    # -23 LUFS 目標線：判讀重點就是「響度有沒有貼在目標線上」
+    ty = bottom - int(bar_zone_h * _spectrum_y_ratio(TARGET_LUFS))
+    pygame.draw.line(surface, (255, 255, 255), (px + MARGIN, ty), (px + MARGIN + bar_area_w, ty), 3)
 
-    # X 軸刻度文字（LUFS），目標值用白色
-    for v in _DIST_X_LABELS:
-        is_target = (v == TARGET_LUFS)
-        label_key = ('dist_xtick', v, is_target)
-        if label_key not in surf_cache:
-            surf_cache[label_key] = font_scale.render(str(v), True, (255, 255, 255) if is_target else (150, 150, 150))
-        label = surf_cache[label_key]
-        lx = px + MARGIN + (v - _DIST_BAR_LO) * (bar_w + MARGIN) + bar_w // 2 - label.get_width() // 2
-        lx = max(px + MARGIN, min(lx, px + pw - MARGIN - label.get_width()))
-        surface.blit(label, (lx, bar_zone_y + bar_zone_h + 2))
+    _draw_x_labels(surface, surf_cache, font_scale, x_ticks, px, pw, bottom, MARGIN)
 
 
-def draw_histogram_screen(surface, fonts, surf_cache, W, H, mode, hour_now):
-    """Histogram 整個畫面：左側三格 LRA / P10 / P95，右側分布圖，版面同 Spectrum 畫面。"""
+def draw_histogram_screen(surface, fonts, surf_cache, W, H, mode, hour_now, vals):
+    """Histogram 整個畫面：左側三格 MOMENTARY / SHORT TERM (3") / LRA（標題寫法同 Loudness 畫面），
+    右側時間軸歷史圖，版面同 Spectrum 畫面。"""
     left_w  = W // 5
     third_h = H // 3
-    counts  = _dist_snapshot(mode)
-    stats   = dist_lra(counts)
-    if stats is None:
-        lra_s = p10_s = p95_s = "---"
-        p10_c = p95_c = (255, 255, 255)
-    else:
-        lra, p10, p95 = stats
-        lra_s, p10_s, p95_s = f"{lra:.1f}", f"{round(p10)}", f"{round(p95)}"
-        p10_c, p95_c = lufs_to_color(p10), lufs_to_color(p95)
+    snap    = tl_snapshot(mode)
+    lra_s   = "---" if snap[4] is None else f"{snap[4]:.1f}"
 
-    draw_number_only_panel(surface, fonts, surf_cache, "LRA", None, 0, left_w, 0, third_h,
-                           val_str=lra_s, num_color=(255, 255, 255))
-    draw_number_only_panel(surface, fonts, surf_cache, "P10", None, 0, left_w, third_h, third_h,
-                           val_str=p10_s, num_color=p10_c)
-    draw_number_only_panel(surface, fonts, surf_cache, "P95", None, 0, left_w, 2 * third_h, H - 2 * third_h,
-                           val_str=p95_s, num_color=p95_c)
+    draw_number_only_panel(surface, fonts, surf_cache, "MOMENTARY", vals["M"], 0, left_w, 0, third_h,
+                           num_color=lufs_to_color(vals["M"]))
+    draw_number_only_panel(surface, fonts, surf_cache, 'SHORT TERM (3")', vals["S"], 0, left_w, third_h, third_h,
+                           num_color=lufs_to_color(vals["S"]))
+    draw_number_only_panel(surface, fonts, surf_cache, "LRA", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                           val_str=lra_s, num_color=(255, 255, 255), ref_strs=_LRA_REFS)
     for i in (1, 2):
         pygame.draw.line(surface, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
     pygame.draw.line(surface, (55, 55, 55), (left_w, 0), (left_w, H), 1)
 
-    title = f"LUFS HISTOGRAM - THIS HOUR ({hour_now})" if mode == "hour" else "LUFS HISTOGRAM - SLIDING (3')"
-    draw_histogram_panel(surface, fonts, surf_cache, dist_bars(counts), title, left_w, W - left_w, 0, H)
+    title = f"LUFS HISTOGRAM - THIS HOUR ({hour_now})" if mode == "hour" else f"LUFS HISTOGRAM - SLIDING ({_TL_SLIDE_MIN}')"
+    draw_histogram_panel(surface, fonts, surf_cache, mode, snap, title, left_w, W - left_w, 0, H)
+
+
+def draw_loudness_screen(surface, fonts, surf_cache, W, H, vals, hour_now, prev_H, prev_SEG):
+    """Loudness 畫面：MOMENTARY／SHORT TERM 兩格大 BAR，右欄 THIS HOUR（上）＋ SEGMENT（下）。"""
+    pw = W // 3
+    for idx, (title, val, lr) in enumerate([
+        ("MOMENTARY",       vals["M"], (vals["M_L"], vals["M_R"])),
+        ('SHORT TERM (3")', vals["S"], None),
+    ]):
+        draw_panel(surface, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr)
+
+    half_h    = H // 2
+    h_delta   = round(vals["H"]) - round(prev_H)     if prev_H   is not None and vals["H"]   > -70 else None
+    seg_delta = round(vals["SEG"]) - round(prev_SEG) if prev_SEG is not None and vals["SEG"] > -70 else None
+    draw_number_only_panel(surface, fonts, surf_cache, f"THIS HOUR ({hour_now})", vals["H"], 2 * pw, pw, 0, half_h,
+                           delta=h_delta, num_color=lufs_to_color(vals["H"]))
+    pygame.draw.line(surface, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
+    draw_number_only_panel(surface, fonts, surf_cache, "SEGMENT (3')", vals["SEG"], 2 * pw, pw, half_h, H - half_h,
+                           delta=seg_delta, delta_align='side')
+    for i in (1, 2):
+        pygame.draw.line(surface, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
+
+
+def draw_spectrum_screen(surface, fonts, surf_cache, W, H, vals, band_levels, peaks, freq_idx):
+    """Spectrum 畫面：左欄 ALL LUFS／BAND dBFS／BAND FREQ，右側 1/3 Octave 長條圖。"""
+    left_w = W // 5
+    if freq_idx == BYPASS_INDEX:
+        freq_str, dbfs_str = "ALL", "---"
+    else:
+        freq_str = _fmt_freq(OCTAVE_BANDS[freq_idx][0])
+        dbfs_str = f"{round(peaks[freq_idx])}"
+
+    third_h = H // 3
+    draw_number_only_panel(surface, fonts, surf_cache, "ALL LUFS", vals["M"], 0, left_w, 0, third_h,
+                           num_color=lufs_to_color(vals["M"]))
+    draw_number_only_panel(surface, fonts, surf_cache, "BAND dBFS", None, 0, left_w, third_h, third_h,
+                           val_str=dbfs_str, num_color=(255, 255, 255))
+    draw_number_only_panel(surface, fonts, surf_cache, "BAND FREQ", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                           val_str=freq_str, num_color=(255, 255, 255), ref_strs=_FREQ_REFS)
+    for i in (1, 2):
+        pygame.draw.line(surface, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
+    pygame.draw.line(surface, (55, 55, 55), (left_w, 0), (left_w, H), 1)
+
+    draw_spectrum_panel(surface, fonts, surf_cache, band_levels, left_w, W - left_w, 0, H,
+                        highlight_index=freq_idx, peak_levels=peaks)
 
 
 _DISPLAY_CYCLE = ("loudness", "spectrum", "histogram")
@@ -824,17 +880,17 @@ def _toggle_display_mode():
 
 def _step_freq(delta):
     """上一個/下一個頻率鈕的共用處理——Spectrum 畫面步進頻率；Histogram 畫面則是兩顆都切換
-    統計範圍（整點累積 ↔ 滑動 3 分鐘，只有兩個選項，方向沒有意義）；Loudness 畫面不生效，避免 PM5D 端誤觸。
+    時間範圍（整點起 0~60 分 ↔ 最近 10 分鐘，只有兩個選項，方向沒有意義）；Loudness 畫面不生效，避免 PM5D 端誤觸。
     撞到邊界時繞到另一頭（wraparound），不是卡住不動：萬一其中一顆鍵故障，
     另一顆單獨連續按繞一圈還是能到達所有頻段，不會有走不到的死角。
     清單最後一格（BYPASS_INDEX）代表「不選定特定頻段」，純顯示狀態（BAND dBFS／
     BAND FREQ 顯示 ---／ALL），不影響任何音訊處理——Pi 本來就不輸出音訊。
     純粹更新 freq_index，不做任何運算，停在哪一格完全零成本。"""
-    global freq_index, dist_mode
+    global freq_index, hist_mode
     pin = GPIO_PIN_FREQ_PREV if delta < 0 else GPIO_PIN_FREQ_NEXT
     if display_mode == "histogram":
-        dist_mode = "slide" if dist_mode == "hour" else "hour"
-        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> dist_mode={dist_mode}", flush=True)
+        hist_mode = "slide" if hist_mode == "hour" else "hour"
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> hist_mode={hist_mode}", flush=True)
         return
     if display_mode != "spectrum":
         print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> ignored, not in spectrum mode", flush=True)
@@ -847,10 +903,67 @@ def _step_freq(delta):
     print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, f_center={f_center}Hz", flush=True)
 
 
-def main():
-    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG, st_history, seg_history
+def _log_cache(surf_cache):
+    """診斷用（2026-10-03 加）：響度計連跑 14 天 RSS 長到 346 MB，成長全在主 heap（Rust 那邊不動），
+    懷疑是 surf_cache 沒有上限——每出現一個新的數字字串就多快取幾張大圖。每 10 分鐘印一行：
+    快取張數、總 MB、各類張數，附 RSS。快取 MB 跟著 RSS 一起漲就是它；RSS 漲但快取不動就是別的東西。"""
+    by_type = collections.Counter()
+    nbytes  = 0
+    for k, v in surf_cache.items():
+        for s in (v.values() if isinstance(v, dict) else (v,)):   # 'glyphs' 存的是一整套字元的 dict
+            nbytes += s.get_width() * s.get_height() * s.get_bytesize()
+        by_type[k[0]] += 1
+    with open("/proc/self/status") as f:
+        rss = next(int(line.split()[1]) for line in f if line.startswith("VmRSS:"))
+    print(f"[CACHE] n={len(surf_cache)} {nbytes / 1e6:.1f}MB rss={rss // 1024}MB "
+          + " ".join(f"{k}={c}" for k, c in by_type.most_common()), flush=True)
 
-    DEVICE = _setup_scarlett()
+
+def make_fonts(W):
+    """以 1920 為基準做比例縮放，適應任何解析度。tools/ 的離屏渲染與量測腳本也呼叫這裡，字級只有一份。"""
+    _scale = W / 1920
+    _fs_value  = max(80,  round(250 * _scale))
+    _fs_lr     = max(50,  round(140 * _scale))
+    _fs_delta  = max(32,  round(100 * _scale))   # delta 獨立字型，比 L/R 略小
+    _fs_title  = max(24,  round(70  * _scale))
+    _fs_axis   = max(16,  round(60  * _scale))   # Spectrum／Histogram 軸文字（1280 寬時 40px），2026-10-09 由 32 加大
+
+    font_title = pygame.font.SysFont("monospace", _fs_title, bold=True)
+    font_axis  = pygame.font.SysFont("monospace", _fs_axis)
+
+    dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DSEG7Modern-Bold.ttf")
+    try:
+        font_value = pygame.font.Font(dseg_path, _fs_value)
+        font_lr    = pygame.font.Font(dseg_path, _fs_lr)
+        font_delta = pygame.font.Font(dseg_path, _fs_delta)
+        print(f"DSEG7Modern loaded: {dseg_path}")
+    except (FileNotFoundError, pygame.error) as e:
+        print(f"DSEG7Modern not found ({e}), fallback to monospace")
+        font_value = pygame.font.SysFont("monospace", _fs_value, bold=True)
+        font_lr    = pygame.font.SysFont("monospace", _fs_lr, bold=True)
+        font_delta = pygame.font.SysFont("monospace", _fs_delta, bold=True)
+
+    return (font_title, font_axis, font_value, font_lr, font_delta)
+
+
+def warm_glyph_cache(fonts, surf_cache, W, H):
+    """開機預熱：三個畫面（Histogram 兩種模式）各離屏畫一次。每種字級第一次出現時，_glyph_set 會把整套
+    字元 × 整個調色盤一次畫好，所以畫一次就涵蓋執行中所有可能的數字與顏色。
+    要在開音訊 stream 之前呼叫——這一兩秒的大量渲染如果發生在執行中，就是 2026-10 那 7 次溢位的成因。"""
+    warm  = pygame.Surface((W, H))
+    dummy = {"M": -23.0, "S": -23.0, "H": -23.0, "SEG": -23.0, "M_L": -23.0, "M_R": -23.0}
+    draw_loudness_screen(warm, fonts, surf_cache, W, H, dummy, 0, -24.0, -24.0)      # 給前值，變化量才會畫到
+    draw_spectrum_screen(warm, fonts, surf_cache, W, H, dummy,
+                         [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS), _spectrum_peaks, 0)
+    for mode in ("hour", "slide"):
+        draw_histogram_screen(warm, fonts, surf_cache, W, H, mode, 0, dummy)
+
+
+def main():
+    global current_hour, reset_hour_flag, _running, prev_H, prev_SEG
+
+    DEVICE = select_input_device(sd.query_devices(), os.environ.get("LM_AUDIO_DEVICE", "").strip(),
+                                 interactive=sys.stdin.isatty())
 
     # Start compute thread before opening audio stream
     ct = threading.Thread(target=compute_loop, daemon=True)
@@ -866,37 +979,13 @@ def main():
     pygame.mouse.set_visible(False)
     clock  = pygame.time.Clock()
 
-    # 以 1920 為基準做比例縮放，適應任何解析度
-    _scale = W / 1920
-    _fs_value  = max(80,  round(250 * _scale))
-    _fs_lr     = max(50,  round(140 * _scale))
-    _fs_delta  = max(32,  round(100 * _scale))   # delta 獨立字型，比 L/R 略小
-    _fs_title  = max(24,  round(70  * _scale))
-    _fs_scale  = max(16,  round(32  * _scale))
+    fonts = make_fonts(W)
 
-    font_title = pygame.font.SysFont("monospace", _fs_title, bold=True)
-    font_scale = pygame.font.SysFont("monospace", _fs_scale)
-
-    dseg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DSEG7Modern-Bold.ttf")
-    try:
-        font_value = pygame.font.Font(dseg_path, _fs_value)
-        font_lr    = pygame.font.Font(dseg_path, _fs_lr)
-        font_delta = pygame.font.Font(dseg_path, _fs_delta)
-        print(f"DSEG7Modern loaded: {dseg_path}")
-    except (FileNotFoundError, pygame.error) as e:
-        print(f"DSEG7Modern not found ({e}), fallback to monospace")
-        font_value = pygame.font.SysFont("monospace", _fs_value, bold=True)
-        font_lr    = pygame.font.SysFont("monospace", _fs_lr, bold=True)
-        font_delta = pygame.font.SysFont("monospace", _fs_delta, bold=True)
-
-    fonts = (font_title, font_scale, font_value, font_lr, font_delta)
-
-    surf_cache = {}   # surface cache: keyed by (type, content, ...) — rebuilt only on change
+    # surface cache：標題、軸文字、單一字元（各字級各色）——開機預熱後就不會再長
+    surf_cache = {}
 
     seg_snapshot_time = time.time() + 180.0   # 3 分鐘後第一次快照
-    st_snapshot_time  = time.time() + 3.0     # 3 秒後第一次 SHORT TERM 快照
-
-    pw = W // 3
+    cache_log_time    = time.time() + 60.0    # 快取診斷 log：1 分鐘後第一筆，之後每 10 分鐘
 
     btn_toggle = Button(GPIO_PIN_TOGGLE, pull_up=True, bounce_time=0.05)
     btn_toggle.when_pressed = _toggle_display_mode
@@ -923,6 +1012,10 @@ def main():
         blocksize=BLOCK_SIZE, callback=audio_callback,
     )
 
+    t_warm = time.monotonic()
+    warm_glyph_cache(fonts, surf_cache, W, H)       # 一定要在 `with stream:` 之前，見 docstring
+    print(f"glyph cache warmed: {len(surf_cache)} entries in {time.monotonic() - t_warm:.2f}s", flush=True)
+
     with stream:
         while True:
             for event in pygame.event.get():
@@ -942,20 +1035,16 @@ def main():
                 reset_hour_flag = True
 
             now_t = time.time()
-            if now_t >= st_snapshot_time:
-                with lock:
-                    st_val = latest["S"]
-                if st_val > -70:
-                    st_history.append(st_val)
-                st_snapshot_time = now_t + 3.0
-
             if now_t >= seg_snapshot_time:
                 with lock:
                     seg_val = latest["SEG"]
                 if seg_val > -70:
-                    seg_history.append(seg_val)
                     prev_SEG = seg_val
                 seg_snapshot_time = now_t + 180.0
+
+            if now_t >= cache_log_time:
+                _log_cache(surf_cache)
+                cache_log_time = now_t + 600.0
 
             screen.fill((15, 15, 15))
 
@@ -963,52 +1052,18 @@ def main():
                 vals = dict(latest)
 
             if display_mode == "loudness":
-                for idx, (title, val, lr, hist) in enumerate([
-                    ("MOMENTARY",       vals["M"], (vals["M_L"], vals["M_R"]), None),
-                    ('SHORT TERM (3")', vals["S"], None,                       st_history),
-                ]):
-                    draw_panel(screen, fonts, surf_cache, title, val, idx * pw, pw, H, lr_vals=lr, history=hist)
-
-                # H panel: THIS HOUR (top) + SEGMENT (bottom), number only
-                half_h    = H // 2
-                h_delta   = round(vals["H"]) - round(prev_H)   if prev_H   is not None and vals["H"]   > -70 else None
-                seg_delta = round(vals["SEG"]) - round(seg_history[-1]) if seg_history and vals["SEG"] > -70 else None
-                draw_number_only_panel(screen, fonts, surf_cache, f"THIS HOUR ({current_hour})", vals["H"],   2 * pw, pw, 0,      half_h,       delta=h_delta, num_color=lufs_to_color(vals["H"]))
-                pygame.draw.line(screen, (55, 55, 55), (2 * pw, half_h), (2 * pw + pw, half_h), 1)
-                draw_number_only_panel(screen, fonts, surf_cache, "SEGMENT (3')",                vals["SEG"], 2 * pw, pw, half_h, H - half_h,   delta=seg_delta, history=seg_history, delta_align='side')
-
-                for i in (1, 2):
-                    pygame.draw.line(screen, (55, 55, 55), (i * pw, 0), (i * pw, H), 1)
+                draw_loudness_screen(screen, fonts, surf_cache, W, H, vals, current_hour, prev_H, prev_SEG)
             elif display_mode == "histogram":
-                draw_histogram_screen(screen, fonts, surf_cache, W, H, dist_mode, current_hour)
+                draw_histogram_screen(screen, fonts, surf_cache, W, H, hist_mode, current_hour, vals)
             else:
-                left_w      = W // 5
                 band_levels = compute_spectrum_bands()
                 _update_spectrum_peaks(band_levels)
-                if freq_index == BYPASS_INDEX:
-                    freq_str = "ALL"
-                    dbfs_str = "---"
-                else:
-                    freq_hz  = OCTAVE_BANDS[freq_index][0]
-                    freq_str = _fmt_freq(freq_hz)
-                    dbfs_str = f"{round(_spectrum_peaks[freq_index])}"
-
-                third_h = H // 3
-                draw_number_only_panel(screen, fonts, surf_cache, "ALL LUFS", vals["M"], 0, left_w, 0, third_h,
-                                        num_color=lufs_to_color(vals["M"]))
-                draw_number_only_panel(screen, fonts, surf_cache, "BAND dBFS", None, 0, left_w, third_h, third_h,
-                                        val_str=dbfs_str, num_color=(255, 255, 255))
-                draw_number_only_panel(screen, fonts, surf_cache, "BAND FREQ", None, 0, left_w, 2 * third_h, H - 2 * third_h,
-                                        val_str=freq_str, num_color=(255, 255, 255))
-                for i in (1, 2):
-                    pygame.draw.line(screen, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
-                pygame.draw.line(screen, (55, 55, 55), (left_w, 0), (left_w, H), 1)
-
-                draw_spectrum_panel(screen, fonts, surf_cache, band_levels, left_w, W - left_w, 0, H,
-                                     highlight_index=freq_index, peak_levels=_spectrum_peaks)
+                draw_spectrum_screen(screen, fonts, surf_cache, W, H, vals, band_levels, _spectrum_peaks, freq_index)
 
             pygame.display.flip()
-            clock.tick(FPS)
+            # 主執行緒每幀成本（fill／flip／數字格）隨幀率成比例，降幀率是最便宜的降載手段。
+            # 代價：KEY 切換的畫面反應最長慢一幀（Loudness 100ms、Histogram 200ms）
+            clock.tick(_SCREEN_FPS[display_mode])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,13 @@
-"""離屏渲染 Histogram 畫面（SDL dummy driver，不碰 Wayland、不影響正在跑的響度計）。"""
+"""離屏渲染 Spectrum 與 Histogram（時間軸）畫面存 PNG，用 SDL dummy driver，不碰 Wayland、不影響正在跑的響度計。
+
+Pi 上跑：把 loudness_meter.py 放 /tmp/lmtest/，`python render_hist.py <輸出目錄> [spectrum]`。
+加 spectrum 只渲染 Spectrum——改動 Spectrum 與 Histogram 共用的畫圖程式碼前後各跑一次，
+兩張 spec.png 必須逐位元相同（資料是確定性的，不含亂數）。
+"""
+import datetime
 import os
 import sys
+from unittest import mock
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -16,45 +23,49 @@ W, H = 1280, 720
 screen = pygame.display.set_mode((W, H))
 
 # 跟 main() 一樣的字型設定
-_scale = W / 1920
-fs_value, fs_lr = max(80, round(250 * _scale)), max(50, round(140 * _scale))
-fs_delta, fs_title, fs_scale = max(32, round(100 * _scale)), max(24, round(70 * _scale)), max(16, round(32 * _scale))
-dseg = os.path.expanduser("~/loudness_meter/fonts/DSEG7Modern-Bold.ttf")
-fonts = (
-    pygame.font.SysFont("monospace", fs_title, bold=True),
-    pygame.font.SysFont("monospace", fs_scale),
-    pygame.font.Font(dseg, fs_value),
-    pygame.font.Font(dseg, fs_lr),
-    pygame.font.Font(dseg, fs_delta),
-)
+fonts = lm.make_fonts(W)   # 字級與正式程式同一份（/tmp/lmtest 底下要有 fonts/ 才載得到 DSEG7）
 cache = {}
-
-
-def fill(arr, values):
-    arr[:] = 0
-    for v in values:
-        arr[lm._dist_bin(v)] += 1
-
-
-rng = np.random.default_rng(3)
-# 整點版：主體 -23、一段偏安靜的 -32、少量靜音、少量爆音（尾巴）
-hour_vals = np.concatenate([rng.normal(-23, 2.0, 30000), rng.normal(-32, 3, 4000), np.full(150, -80.0), rng.normal(-10, 1.0, 60)])
-# 滑動版：最近 3 分鐘整段偏安靜（-36 附近），像目前 PM5D 送的訊號
-slide_vals = rng.normal(-36, 1.5, 1800)
-
 out = sys.argv[1] if len(sys.argv) > 1 else "/tmp"
 
-fill(lm._dist_hour, hour_vals)
-fill(lm._dist_slide, slide_vals)
-for mode in ("hour", "slide"):
-    screen.fill((15, 15, 15))
-    lm.draw_histogram_screen(screen, fonts, cache, W, H, mode, 11)
-    pygame.image.save(screen, f"{out}/hist_{mode}.png")
-
-# 剛清零：只有少量票 → LRA 應顯示 ---
-lm._dist_hour[:] = 0
-fill(lm._dist_hour, hour_vals[:50])
+# ── Spectrum（確定性資料）──
+left_w = W // 5
+levels = [-60.0 + (i * 7) % 55 for i in range(len(lm.OCTAVE_BANDS))]
+peaks = [v + 6 for v in levels]
 screen.fill((15, 15, 15))
-lm.draw_histogram_screen(screen, fonts, cache, W, H, "hour", 11)
-pygame.image.save(screen, f"{out}/hist_fresh.png")
+lm.draw_spectrum_panel(screen, fonts, cache, levels, left_w, W - left_w, 0, H, highlight_index=12, peak_levels=peaks)
+pygame.image.save(screen, f"{out}/spec.png")
+if len(sys.argv) > 2 and sys.argv[2] == "spectrum":
+    print("rendered spectrum only")
+    sys.exit(0)
+
+# ── Histogram：合成節目（整點起 40 分鐘）：安靜 → 大聲 → 靜音空檔 → 中等，樣本間隔 1.14 秒 ──
+NOW = datetime.datetime(2026, 9, 19, 12, 40, 0).timestamp()
+t = NOW - 40 * 60 + 5 + np.arange(0, 40 * 60 - 5, 1.14)
+minute = (t - (NOW - 40 * 60)) / 60
+rng = np.random.default_rng(3)
+s = np.select(
+    [minute < 8, minute < 22, minute < 25],
+    [-38 + rng.normal(0, 1.5, len(t)), -23 + rng.normal(0, 3, len(t)), np.full(len(t), -70.0)],
+    default=-27 + rng.normal(0, 2, len(t)),
+)
+vals = {"M": -26.4, "S": -27.1}
+
+
+def render(name, mode):
+    screen.fill((15, 15, 15))
+    with mock.patch("time.time", lambda: NOW):
+        lm.draw_histogram_screen(screen, fonts, cache, W, H, mode, 12, vals)
+    pygame.image.save(screen, f"{out}/{name}.png")
+
+
+lm._tl_q.clear()
+lm._tl_q.extend(zip(t.tolist(), s.tolist()))
+render("hist_hour", "hour")
+render("hist_slide", "slide")
+
+# 剛整點：只有 30 筆樣本 → 圖是空的大半、LRA 顯示 ---
+lm._tl_q.clear()
+lm._tl_q.extend(zip(t[:30].tolist(), s[:30].tolist()))
+lm._tl_memo["key"] = None
+render("hist_fresh", "hour")
 print("rendered ok")

@@ -1,0 +1,2 @@
+# Pi 上執行的 shell 腳本一律 LF：Windows 的 CRLF 會讓 bash 出錯（例如 $'': command not found）
+*.sh text eol=lf

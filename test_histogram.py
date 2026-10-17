@@ -1,8 +1,9 @@
-"""Histogram 邏輯自我檢查：LRA 對得上精確解、滑動版進出帳不漂移、邊緣併根、整點清零。
+"""Histogram（時間軸）邏輯自我檢查：分欄、LRA（對 EBU Tech 3342 官方最低要求測試案例）、整點／滑動視窗。
 
 直接 import 真的 loudness_meter（不是複製一份）——頂層那些硬體相關套件用 stub 擋掉，
 這樣改了 loudness_meter.py 的 histogram 邏輯，這裡不用同步更新。
 """
+import datetime
 import os
 import sys
 from unittest import mock
@@ -21,78 +22,63 @@ except ImportError:
 
 import loudness_meter as lm  # noqa: E402
 
-clock = [0.0]
+# 1) tl_columns：欄位歸屬、欄內取最大值、無樣本的欄是 NaN、視窗外（前後）的樣本忽略
+t = np.array([999.0, 1000.0, 1359.9, 1360.0, 4599.0, 4600.0])
+s = np.array([-10.0, -30.0, -25.0, -40.0, -20.0, -15.0])
+cols = lm.tl_columns(t, s, t0=1000.0, span=3600.0, n=10)      # 每欄 360 秒
+assert cols[0] == -25.0, "1000 與 1359.9 在同一欄，應取最大值 -25"
+assert cols[1] == -40.0, "1360 是第 1 欄的第一個樣本"
+assert cols[9] == -20.0, "4599 在最後一欄"
+assert np.isnan(cols[2:9]).all(), "沒有樣本的欄要是 NaN"
+# 999（視窗前）與 4600（視窗後）都不能被算進任何一欄——-10 與 -15 都不該出現
+assert -10.0 not in cols and -15.0 not in cols, "視窗外的樣本被算進去了"
+print("[OK] tl_columns：欄位歸屬／取最大／空欄／視窗外")
 
 
-def reset():
-    lm._dist_hour[:] = 0
-    lm._dist_slide[:] = 0
-    lm._dist_slide_q.clear()
-    lm._dist_hour_seen = lm.current_hour
-    clock[0] = 0.0
+# 2) LRA：EBU Tech 3342 V4 Table 1 的最低要求測試案例（各段 100 筆；段間的 LU 差就是預期的 LRA，容許 ±1）
+def seg(*levels):
+    return np.repeat(np.array(levels, dtype=float), 100)
 
 
-def feed(values, dt=0.1):
-    with mock.patch("time.monotonic", lambda: clock[0]):
-        for v in values:
-            lm._dist_feed(float(v))
-            clock[0] += dt
+for name, levels, want in [("#1 兩段差 10 LU", (-23, -33), 10), ("#2 兩段差 5 LU", (-20, -15), 5),
+                           ("#3 兩段差 20 LU", (-40, -20), 20), ("#4 五段（含被相對閘門擋掉的兩段）", (-50, -35, -20, -35, -50), 15)]:
+    got = lm.tl_lra(seg(*levels))
+    print(f"    LRA {name}: {got:.2f}（預期 {want} ±1）")
+    assert abs(got - want) <= 1, f"{name}：LRA {got} 不在 {want} ±1 內"
+assert lm.tl_lra(np.full(500, -70.0)) is None, "全靜音（≤ -70 被絕對閾值擋掉）不該算 LRA"
+assert lm.tl_lra(seg(-23, -33)[::4]) is None, "過閘後樣本 < 60 筆不該算 LRA"
+print("[OK] LRA：Tech 3342 四個測試案例／全靜音／樣本不足")
 
 
-def exact_lra(values):
-    """不分桶、直接對原始值算的 Tech 3342（對照組）。"""
-    v = np.asarray(values)
-    v = v[v > -70.0]
-    rel = lm._energy_to_lufs(np.mean(10 ** ((v + 0.691) / 10))) - 20.0
-    v = v[v > rel]
-    p10, p95 = np.percentile(v, 10), np.percentile(v, 95)
-    return p95 - p10, p10, p95
+# 3) 視窗選取：整點版 = 本整點起（整點一過自然清空）；滑動版 = 最近 10 分鐘
+def at(h, m, sec=0):
+    return datetime.datetime(2026, 9, 19, h, m, sec).timestamp()
 
 
-rng = np.random.default_rng(7)
-# 主體 -23、一段偏安靜的 -30、少量靜音（-80，低於絕對閾值）、少量爆音（-8）
-vals = np.concatenate([rng.normal(-23, 2, 3500), rng.normal(-30, 3, 1200), np.full(200, -80.0), rng.normal(-8, 1, 100)])
-rng.shuffle(vals)
+lm._tl_q.clear()
+lm._tl_q.extend((x, -25.0) for x in [at(11, 59, 59), at(12, 0), at(12, 37, 2), at(12, 37, 3), at(12, 39, 59)])
+t0, span, t, s, _ = lm._tl_build("hour", at(12, 40))
+assert (t0, span, len(t)) == (at(12, 0), 3600.0, 4), "整點版：11:59:59 是上個整點的，不該算"
+# 滑動版：60 根 × 3 秒，最右一根是 12:40:00~12:40:03 這格 → 起點 = 12:40:00 - 59 × 3 = 12:37:03
+t0, span, t, s, _ = lm._tl_build("slide", at(12, 40))
+assert (t0, span, len(t)) == (at(12, 37, 3), 180.0, 2), "滑動版：12:37:02 已在 3 分鐘窗口外"
 
-# 1) 整點版 LRA / P10 / P95 對得上精確解（分桶誤差每個百分位 ≤ 0.05 LU，容許 0.15）
-reset()
-feed(vals)
-got, want = lm.dist_lra(lm._dist_hour.copy()), exact_lra(vals)
-print("LRA/P10/P95  histogram:", np.round(got, 2), " exact:", np.round(want, 2))
-assert all(abs(g - w) < 0.15 for g, w in zip(got, want)), "LRA/P10/P95 跟精確解差太多"
 
-# 2) 滑動版進出帳不漂移：窗口內的票數 == 「從頭重掃最近 180 秒」的結果
-tail = vals[-int(lm._DIST_SLIDE_SEC / 0.1):]          # 餵了 5000 票、每票 0.1 秒，窗口內應剩最後 ~1800 票
-recount = np.bincount([lm._dist_bin(v) for v in tail], minlength=lm._DIST_N)
-assert abs(int(lm._dist_slide.sum()) - len(tail)) <= 1, f"窗口票數 {lm._dist_slide.sum()} != {len(tail)}"
-assert int(lm._dist_slide.sum()) == len(lm._dist_slide_q), "計數與佇列長度不一致（退票漏了）"
-assert np.abs(lm._dist_slide - recount).sum() <= 2, "進出帳跟重掃結果不一致（有漂移）"
-print("[OK] 滑動版進出帳：窗口 %d 票，與重掃一致" % lm._dist_slide.sum())
+def col_of(sample_t, now):
+    t0, span, *_ = lm._tl_build("slide", now)
+    c = lm.tl_columns(np.array([sample_t]), np.array([-25.0]), t0, span, lm._TL_SLIDE_N)
+    return int(np.flatnonzero(~np.isnan(c))[0])
 
-# 3) 邊緣併根：低於閾值、超出兩側的票都要算進邊緣根，總票數守恆；-23 要落在第 27 根
-reset()
-feed([-80.0, -60.0, -50.4, -23.0, -23.4, -23.6, -9.6, 5.0])
-bars = lm.dist_bars(lm._dist_hour.copy())
-assert int(bars.sum()) == 8, "併根後總票數不守恆"
-assert bars[0] == 3 and bars[-1] == 2, f"邊緣根 {bars[0]}/{bars[-1]} 不對（低於閾值/-60/-50.4 併最左；-9.6/+5 併最右）"
-assert bars[27] == 2 and bars[26] == 1, "-23.0/-23.4 應在第 27 根、-23.6 應在第 26 根"
-print("[OK] 邊緣併根與 -23 對位")
 
-# 4) 整點清零：換小時後整點版只剩新票，滑動版不受影響
-reset()
-feed(vals[:100])
-lm.current_hour = (lm.current_hour + 1) % 24
-feed(vals[100:101])
-assert int(lm._dist_hour.sum()) == 1 and int(lm._dist_slide.sum()) == 101, "整點清零行為不對"
-print("[OK] 整點清零")
-
-# 5) 票數不足 / 全靜音 → None（畫面顯示 ---）
-reset()
-feed(vals[:100])
-assert lm.dist_lra(lm._dist_hour.copy()) is None, "不足 60 秒票數不該算 LRA"
-reset()
-feed(np.full(2000, -80.0))
-assert lm.dist_lra(lm._dist_hour.copy()) is None, "全靜音不該算 LRA"
-print("[OK] 票數不足 / 全靜音回 None")
+# 對齊 3 秒：同一筆樣本在同一個 3 秒內（下一幀、再下一幀）不能換欄，跨過 3 秒邊界剛好往左移一欄——否則畫面會閃
+x = at(12, 39, 59)
+assert col_of(x, at(12, 40)) == col_of(x, at(12, 40) + 0.2) == col_of(x, at(12, 40) + 2.9) == 58
+assert col_of(x, at(12, 40, 3)) == 57, "跨過 3 秒邊界要剛好往左一欄"
+t0, span, t, s, lra = lm._tl_build("hour", at(13, 0, 1))
+assert len(t) == 0 and lra is None, "整點一過，整點版要自然清空"
+lm._tl_q.clear()
+_, _, t, s, lra = lm._tl_build("hour", at(12, 40))
+assert len(t) == 0 and lra is None, "沒有任何樣本時不能出錯"
+print("[OK] 視窗選取：整點版／滑動版／整點清空／空序列")
 
 print("\n全部通過")

@@ -1,0 +1,7 @@
+# 響度計的 Python 套件（裝進 venv）。版本跟正式機（2026-10，Raspberry Pi OS Trixie 64-bit、Python 3.13）一致。
+# 不在這裡的：gpiozero / lgpio 用系統套件（apt，venv 開 --system-site-packages）；
+# lufs_core（本專案的 Rust 模組）從 wheels/ 安裝，見 install.sh。
+numpy==2.4.4
+scipy==1.17.1
+sounddevice==0.5.5
+pygame==2.6.1
