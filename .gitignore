@@ -5,3 +5,8 @@ set-pi-ip.bat
 # Python
 __pycache__/
 *.pyc
+
+# 介紹短片的產物與現場照片（照片含台內設備，不進公開 repo）
+intro_src/
+intro*.mp4
+intro_still_*.png

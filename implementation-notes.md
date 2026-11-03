@@ -2,6 +2,21 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-11-03：30 秒介紹短片（社群分享用）
+
+- `tools/make_intro_video.py`：素材直接用 `assets/*_preview.gif`（不連 Pi 重錄），Pillow 疊框選／調暗／字卡，rawvideo 串流給 ffmpeg 出 H.264 MP4（1920×1080、30 fps、無聲）。`--still <秒>` 出樣張。產物 `intro_30s.mp4`、`intro_still_*.png` 在專案根目錄，**未 commit**。
+- GIF 原始幀率約 2 fps（當初是逐張截圖），影片裡依段長平均播放指定幀範圍：Spectrum／Loudness 約加速 2 倍；Histogram 取第 12~43 幀，剛好涵蓋 THIS HOUR → SLIDING 的切換。
+- **顏色說法改成客觀數值區間**（使用者提出「紅＝太大聲」有主觀判斷）：EBU 沒有規定 meter 顏色，−30／−23／−10 是本系統自訂；R128 的 −23 ±0.5 LU（直播 ±1）是 Integrated 目標，M／S 本來就會跳。EBU 對 S 唯一的上限是 R 128 s1 的 −18 LUFS，**只適用短片（廣告／宣傳）**。影片字卡改寫為「顏色＝數值落在哪一區」＋附註「顏色分區為本系統自訂」。README 草稿還是舊說法（「超過目標值／太大聲」），待使用者決定是否一併改。
+- 第二版（使用者回饋）：拿掉片尾，KEY 9／10／11 說明改放每段字卡右上（名稱照 README「USER DEFINED KEYS（Bank A）」）；三段改 9／9.5／9.5 秒補滿 30 秒。
+  - **背景閃一下的原因**：每換一步，調暗都從 0 重新淡入 → 整片先亮再暗。改成兩組框選區的調暗遮罩交叉淡化（框外一直維持調暗），框選區不變就完全不做過場。驗證法：ffmpeg `signalstats` 逐幀 YAVG，相鄰幀差 >8 的只剩段落切換與 GIF 本身換幀。
+  - Spectrum 選定頻段：逐幀從長條底列找淺藍色像素定位那根 bar（KEY 換頻段時框會跟著移動），與左欄 BAND 讀數一起框。
+  - 第三版：片頭改兩張卡（標題＋LM6505 現場照、訊號來源＋PM5D 面板照框出 STEREO A／DEFINE／KEY 9~11），總長 40 秒，輸出改名 `intro.mp4`。照片放 `intro_src/`，**照片有台內資產標籤與節目畫面，已加進 .gitignore 不進公開 repo**。BAND dBFS 字卡用「電平」不用「響度」（它是該頻段 dBFS 峰值，不是 LUFS）；Histogram 第一步補上縱軸＝響度、每根約 7 秒（整點版 508 欄／3600 秒，`draw_histogram_panel` 寫的是 1280 寬時的值）。
+  - 第四版（50 秒）：photo1 馬賽克（上排監看、左邊節目畫面、資產標籤，原檔不動）；訊號卡加「MONITOR LEVEL 旋鈕已校正」警示；新增第三張卡「讀數出不來？依序檢查」5 步（使用者提供，見下）。Spectrum 第一步改「越高電平越大」：長條是該頻段 FFT 功率加總的 dBFS（沒有 K-weighting），是電平不是響度。README 標題改「樹莓派多功能響度計」。
+  - **一棚 MIX 20 → Meter 的送訊鏈**（使用者 2026-11-03 說明，平常已設定好）：① MIX 20 MASTER ON、輸出推桿 0 dB ② 音軌 SEND 到 MIX 20 ON（PRE）③ MONITOR ON、推桿 0 dB、LEVEL 旋鈕在校正位置 ④ MONITOR 選 DEFINE（STEREO A 要關，否則兩路疊加）⑤ MON/CUE 畫面 DEFINE 指定 MIX 20（KEY 12 是一鍵設定）。PM5D 說明書（簡中版 p.100）證實 MONITOR [LEVEL] 旋鈕調的就是 MONITOR OUT 輸出電平 → **轉旋鈕會改變響度計讀數**，目前位置是校正過的。
+    - 更正（使用者補充＋說明書）：SEND 用 PRE／POST 皆可，要跟 PGM 隔開、單獨看某個音軌才必須 PRE。「推桿 0 dB」不是實體推桿：MIX 輸出電平是按 [MIX MASTER] 鍵後用 MIX 編碼器調（p.60），也可在畫面上設定；MONITOR OUT 的大小由 MON/CUE 畫面的 MONITOR LEVEL（數位）**加上**面板 [LEVEL] 旋鈕（類比）共同決定（p.240），所以畫面上 0 dB、旋鈕沒轉開一樣沒聲音。
+  - 第六、七版：三個畫面各延長到 14 秒（每步約 3.5 秒）；加 6 秒片尾 QR code（GitHub repo、HackMD 文章），用 `segno` 產生（純 Python 無相依，只在 outro_card 內 import）。總長 70 秒。
+  - Histogram 模式切換：GIF 第 16 幀換成 SLIDING，幀範圍 8~44 配 9.5 秒讓切換剛好落在字卡換步的 2.12 秒；切換後框改成只框標題＋時間軸刻度（變的就是這兩處），跟前一步的整張圖區隔開。
+
 ## 2026-10-17（第三輪）：第二次四畫面輪流監測（有訊號）＋ 校正 Pi 時鐘
 
 **監測**（Pi 14:48 ~ 17:28，同第一次的排程；這次進度回報多一欄「訊號」：間隔 3 秒截兩張圖比對整個畫面，靜音時整個畫面靜止。**全程都有訊號**）：
