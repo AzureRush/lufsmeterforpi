@@ -91,8 +91,8 @@ CHECK_CARD = ([MK_DEFINE, MK_LEVEL, MK_ON, MK_KEY12], [
 ])
 INTRO = [4.0, 9.0, 9.0]     # 片頭三張卡各幾秒
 OUTRO = 6.0
-OUTRO_LINKS = [("程式碼（GitHub）", "https://github.com/AzureRush/lufsmeterforpi"),
-               ("介紹文章（HackMD）", "https://hackmd.io/@penomadd/audiometer")]
+OUTRO_LINKS = [("功能詳細介紹與原始碼", "https://github.com/AzureRush/lufsmeterforpi"),
+               ("讓 Audio Meter「有意義的」跳動", "https://hackmd.io/@penomadd/audiometer")]
 TOTAL = sum(INTRO) + sum(s[1] for s in SEGMENTS) + OUTRO
 
 
