@@ -2,6 +2,32 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-11-22 01:53：極性／相位測試音檔（PHASE 畫面規劃前置）
+
+起因：錄影現場兩位主持人坐很近，推上兩支麥克風後聲音發悶，按 Ø 才正常。規劃在 Pi 上加第 4 個 PHASE 畫面（goniometer＋correlation＋分頻 correlation，**尚未實作**，只做了瀏覽器模擬）。使用者覺得模擬的 goniometer 看不出狀態，改成先產生測試音檔，播給筆電上的 Process.Audio Decibel Phase Scope 對照。
+
+- `tools/make_phase_test.py` → `test_audio/phase_test.wav`（48 kHz／16-bit／72 秒，約 13.8 MB；**沒加進 .gitignore，也沒 commit**，要不要進 repo 待決定，腳本隨時能重生）
+- 訊號用**粉紅雜訊**，不用人聲：goniometer 上的形狀最清楚，而且每段的 correlation 理論值是固定的，可以拿來 assert。缺點是聽起來不像主持人，梳狀濾波那段聽感也跟人聲不一樣
+- 8 段、每段 8 秒、段間 1 秒靜音，**沒有語音報段**：語音本身是單聲道，報段時畫面會閃成直線，反而干擾判讀，所以改成印出時間對照表
+- 實測 correlation：同相 +1.00／反相 −1.00／只有左或右 0.00／不相關 −0.01／立體聲 +0.80／梳狀濾波（晚 1 ms）+0.13／正常擺位漏音 +0.07。梳狀濾波的寬頻 correlation 不會掉到負值，**要看分頻 correlation 才看得出來**，這也是 PHASE 畫面規劃加分頻長條的理由
+- RNG seed 固定（2026），每次重產的檔案都一樣
+- **已用 Decibel 實機對照**：在筆電上播放，同時截取 Decibel Phase Scope，8 段的形狀和 CORRELATION／BALANCE 指示點都符合預期，左右方向也一致（使用者確認）
+- **第 7、8 段的教訓**：兩段的分頻 correlation 都是一正一負交錯（兩段都是延遲的複本），差別只在 BAL：0 dB 對 +10 dB。correlation 只看「像不像」，不看音量，**單看分頻 correlation 會把 3:1 擺位下無害的漏音誤判成問題**。PHASE 畫面要把 BAL 跟分頻放在一起看，之後可以考慮合成「預估凹口深度（dB）」
+
+**PHASE 畫面繪圖負擔評估（筆電推估，尚未在 Pi 實測）**：`tools/bench_phase.py`，筆電量完再用「Loudness 整張畫面 Pi 實測 8.1 ms」換算成 Pi 的數字（倍率約 10.5）：
+
+| 畫面 | 推估 Pi 每幀 |
+|---|---|
+| Spectrum（現行，含 FFT） | 約 21 ms |
+| PHASE，goniometer 連線 2400 點 | 約 22 ms |
+| PHASE，連線 1200 點 | 約 18 ms |
+| PHASE，反鋸齒連線 2400 點 | 約 75 ms ❌ |
+
+- 結論：PHASE 跟 Spectrum 同一級，**前提是不用反鋸齒（`aalines` 貴 3.5 倍）、每幀不超過 1200 點**
+- 換算倍率是用「字型為主」的 Loudness 畫面推出來的，「畫線為主」的 goniometer 在 Pi 上的倍率可能不一樣，**要上 Pi 跑 `bench_phase.py` 才算數**
+- 線的成本跟「線段總長度」成正比，雜訊越大、越不相關，相鄰兩點的距離越遠，越貴：同樣 2400 點，放大倍率不同時，量到 2.1 到 3.1 ms 都有
+- **最大風險是 GIL，不是 CPU**：`pygame.draw.lines` 一次畫完所有點的期間會一直持有 GIL，推估在 Pi 上要 17 到 25 ms，已經接近過去實測會造成溢位的約 33 ms。實作時要切成幾段分開呼叫，讓音訊執行緒有機會插進來
+
 ## 2026-11-03：30 秒介紹短片（社群分享用）
 
 - `tools/make_intro_video.py`：素材直接用 `assets/*_preview.gif`（不連 Pi 重錄），Pillow 疊框選／調暗／字卡，rawvideo 串流給 ffmpeg 出 H.264 MP4（1920×1080、30 fps、無聲）。`--still <秒>` 出樣張。產物 `intro_30s.mp4`、`intro_still_*.png` 在專案根目錄，**未 commit**。
