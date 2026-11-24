@@ -2,6 +2,14 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
+## 2026-11-24：手機切換畫面——Wi-Fi 熱點（準備中，尚未上機）
+
+- 動機：搬離 PM5D 後沒有 GPIO 按鍵可切畫面。選項比較後使用者選「Pi 開 Wi-Fi 熱點＋手機網頁按鈕」（藍牙要手機假裝成 HID 鍵盤，iPhone 不行、Android 要裝 App，且目前按 ESC 會關掉響度計）。最便宜的替代是 3 顆常開按鈕直接接 Pin 9/11/13/15（不用改程式，可與 PM5D 並聯）。
+- 決定：SSID `MeterOnPi`、2.4 GHz（`band bg`）、使用者手機 Android、公司允許開熱點。連線名稱 `meter-hotspot`，開機自動啟用（autoconnect priority 100，官方教學的做法；hotspot 指令預設不會 autoconnect）。
+- `tools/check_wifi.sh`（唯讀檢查）、`tools/setup_hotspot.sh`（需 sudo，**由使用者自己執行並輸入 sudo 與熱點密碼**，密碼不經過 Claude、不寫進檔案）。熱點模式下 wlan0＝10.42.0.1 並自帶 DHCP（NetworkManager `ipv4.method shared`，需要 dnsmasq-base）。
+- ⚠ `shared` 會開 IP 轉送＋NAT：目前 eth0 只接筆電沒影響；**哪天 eth0 接上公司網路，手機可經 Pi 進到公司網段**，到時要加阻擋規則。
+- 下一步：熱點上機驗證後，再規劃 loudness_meter.py 內建按鈕網頁（stdlib http.server，呼叫 `_toggle_display_mode`／`_step_freq`）。
+
 ## 2026-11-22 01:53：極性／相位測試音檔（PHASE 畫面規劃前置）
 
 起因：錄影現場兩位主持人坐很近，推上兩支麥克風後聲音發悶，按 Ø 才正常。規劃在 Pi 上加第 4 個 PHASE 畫面（goniometer＋correlation＋分頻 correlation，**尚未實作**，只做了瀏覽器模擬）。使用者覺得模擬的 goniometer 看不出狀態，改成先產生測試音檔，播給筆電上的 Process.Audio Decibel Phase Scope 對照。
