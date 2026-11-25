@@ -162,6 +162,8 @@ Pi 開機會自動開一個 Wi-Fi 熱點（設定方式見 `tools/setup_hotspot.
 
 手機每 1.5 秒同步一次，PM5D 那邊按了 KEY 9，手機上的狀態也會跟著變。網頁沒有密碼，熱點密碼就是門禁。要換 port 或停用，在 `~/.config/labwc/environment` 設 `LM_WEB_PORT=<port>`（`0` 為停用）。
 
+> PHASE 實測要留數字紀錄時，在同一個檔案加 `LM_PHASE_LOG=1` 再重啟響度計：停在 PHASE 畫面時，每 2 秒在 `/tmp/lm.log` 寫一行 `[PHASE]`（時間、CORR、MIN、BAL、NOTCH、各頻段 correlation）。預設關閉——`/tmp` 佔用的是記憶體，長時間開著會一直累積。
+
 ### GPI 訊號對應
 
 PM5D 端在 `GPI OUT` 設定畫面把三個 PORT 指定為 USER DEFINED KEYS，觸發模式 **UNLATCH**、極性 **Low Active**（GPO 為 open collector，觸發時拉低，與 Pi 端的內部上拉相符）：

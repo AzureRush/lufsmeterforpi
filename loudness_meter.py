@@ -1241,14 +1241,15 @@ def start_web_server():
 
 
 _phase_log_t = [0.0]
+_PHASE_LOG   = os.environ.get("LM_PHASE_LOG", "") == "1"   # 預設關；實測時在 ~/.config/labwc/environment 設 LM_PHASE_LOG=1
 
 
 def _log_phase(ph):
-    """PHASE 實測紀錄（2026-11-25 雙麥克風座談用）：在 PHASE 畫面每 2 秒印一行到 /tmp/lm.log，附時間（log 本身沒時間戳）。
-    格式：[PHASE] 時:分:秒 corr min3 bal notch@頻段 | 100 Hz～8 kHz 各頻段 correlation（×10 取整，. ＝ 沒訊號）。
-    每行約 150 字、20 分鐘約 90 KB（/tmp 是 tmpfs 吃 RAM，量很小）。ponytail: 實測用，分析完可以拿掉"""
+    """PHASE 實測紀錄（2026-11-25 雙麥克風座談用）：LM_PHASE_LOG=1 時，在 PHASE 畫面每 2 秒印一行到 /tmp/lm.log，
+    附時間（log 本身沒時間戳）。格式：[PHASE] 時:分:秒 頁 corr min3 bal notch@頻段 | 100 Hz～8 kHz 各頻段 correlation
+    （×10 取整，. ＝ 沒訊號）。預設關：/tmp 是 tmpfs 吃 RAM，PHASE 畫面連開一天約 6.5 MB、不會自己清。"""
     now = time.monotonic()
-    if now - _phase_log_t[0] < 2.0:
+    if not _PHASE_LOG or now - _phase_log_t[0] < 2.0:
         return
     _phase_log_t[0] = now
     f = lambda v: "---" if v is None else f"{v:+.2f}"
@@ -1264,7 +1265,8 @@ _fs = {"t": time.monotonic(), "n": 0, "sum": 0.0, "max": 0.0, "info": ""}
 def _frame_stat(mode, draw, flip):
     """診斷（2026-11-25，追 PHASE GONIO 頁每分鐘約 8 次 input overflow；離屏量每幀才 14.5 ms，正式畫面上一定有
     別的東西變慢）：每分鐘印一行——該分鐘最慢一幀的畫圖／flip 耗時（GONIO 頁再拆殘影／算點／連線／貼圖）、
-    callback 最長間隔。只在 PHASE 畫面、或有異常（幀 ≥ 40 ms、callback 間隔 ≥ 100 ms）時印，平常不灌 log。
+    callback 最長間隔。所有畫面同一規則：只有異常（幀 ≥ 40 ms、callback 間隔 ≥ 100 ms）時才印，平常不灌 log。
+    （GC 修好前 PHASE 畫面每分鐘都印，是追查用；修好後統一，2026-11-25 使用者指出不一致）
     ponytail: 診斷用，查清楚後可以拿掉"""
     global _cb_gap_max
     tot = draw + flip
@@ -1277,7 +1279,7 @@ def _frame_stat(mode, draw, flip):
             "" if g is None else " gon fade/pts/lines/blit " + "/".join(f"{x * 1000:.1f}" for x in g))
     now = time.monotonic()
     if now - _fs["t"] >= 60:
-        if mode == "phase" or _fs["max"] >= 0.04 or _cb_gap_max >= 0.1:
+        if _fs["max"] >= 0.04 or _cb_gap_max >= 0.1:
             print(f"[FRAME] {mode}/{phase_view if mode == 'phase' else '-'} n={_fs['n']} avg {_fs['sum'] / _fs['n'] * 1000:.1f}"
                   f" max {_fs['max'] * 1000:.1f} ms ({_fs['info']}) cb_gap_max {_cb_gap_max * 1000:.0f} ms", flush=True)
         _fs.update(t=now, n=0, sum=0.0, max=0.0, info="")
