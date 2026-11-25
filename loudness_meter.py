@@ -9,6 +9,9 @@ import math
 import time
 import os
 import signal
+import gc
+import json
+import http.server
 from scipy.signal import lfilter
 from gpiozero import Button
 from lufs_core import EnergyStore   # Rust 擴充模組（lufs_core/），保管 block 能量並負責 H / SEG 的 gating 運算
@@ -69,7 +72,7 @@ RED_THRESHOLD    = -10.0
 FPS              = 20   # Spectrum 畫面；peak hold 兩個常數由它推導，改它要一起看
 # 各畫面幀率。Loudness 的 M / S 每秒只算 10 次，20 FPS 有一半的幀在重畫同樣的東西
 # （2026-10-03 實測：主執行緒 39.1% 幾乎全是渲染）；Histogram 的資料每秒才變一次。
-_SCREEN_FPS = {"loudness": 10, "spectrum": FPS, "histogram": 5}
+_SCREEN_FPS = {"loudness": 10, "spectrum": FPS, "histogram": 5, "phase": FPS}
 
 # 窗口長度以「幾個 block」表示（BLOCK_SIZE = 50ms），直接決定 deque 的 maxlen
 M_BLOCKS = 8    # 瞬時窗口 400ms
@@ -170,6 +173,8 @@ _zi_rlb = [np.zeros(2) for _ in range(CHANNELS)]
 # audio callback 的 status（input overflow 等）限流用：累計次數 + 上次印出的時間
 _status_n = 0
 _status_t = time.monotonic()   # 每 60 秒最多印一行，附這段期間的累計次數
+_cb_last    = time.monotonic()   # 診斷（2026-11-25）：audio callback 上次被呼叫的時間
+_cb_gap_max = 0.0                # 這一分鐘內 callback 最長間隔（秒）
 
 latest   = {"M": -70.0, "S": -70.0, "H": -70.0, "M_L": -70.0, "M_R": -70.0, "SEG": -70.0}
 lock     = threading.Lock()
@@ -178,7 +183,8 @@ current_hour    = datetime.datetime.now().hour
 reset_hour_flag = False
 _running        = True
 
-display_mode = "loudness"   # "loudness" / "spectrum" / "histogram" — GPIO 畫面切換鈕控制
+display_mode = "loudness"   # "loudness" / "spectrum" / "histogram" / "phase" — GPIO 畫面切換鈕控制
+phase_view   = "gonio"      # PHASE 畫面的頁："gonio" 看極性 / "band" 看梳狀濾波（KEY10/11 切換）
 freq_index   = 0            # 目前選定/反白的頻段索引，純顯示用（BAND dBFS／BAND FREQ）
 hist_mode    = "hour"       # histogram 畫面的範圍："hour" 整點起 0~60 分 / "slide" 最近 10 分鐘（KEY10/11 切換）
 
@@ -278,7 +284,11 @@ def audio_callback(indata, frames, time_info, status):
     """Lightweight: K-weight + 2 deque appends + 2 store pushes. ~2ms per call 預算。
     單工 input-only stream——Spectrum 模式的耳機監聽改回 Scarlett 硬體 Direct
     Monitor（零延遲），Pi 完全不輸出音訊，純粹是視覺化診斷工具。"""
-    global _zi_pre, _zi_rlb, reset_hour_flag, _status_n, _status_t
+    global _zi_pre, _zi_rlb, reset_hour_flag, _status_n, _status_t, _cb_last, _cb_gap_max
+    now_cb = time.monotonic()            # 診斷：callback 間隔正常是 50 ms，被擋住就會變長（見 _frame_stat）
+    if now_cb - _cb_last > _cb_gap_max:
+        _cb_gap_max = now_cb - _cb_last
+    _cb_last = now_cb
 
     # 溢位時每次都 print 會在 RT callback 裡做同步 I/O，反而加重溢位（而且 /tmp 是
     # tmpfs，log 直接吃 RAM）。改成計數、每分鐘最多印一行。
@@ -655,6 +665,75 @@ def _update_spectrum_peaks(band_levels):
             _spectrum_peaks[i] = max(v, _spectrum_peaks[i] - _PEAK_DECAY_PER_FRAME)
 
 
+# ─── PHASE（極性／梳狀濾波，2026-11-25） ──────────────────────────────────────
+# 起因：錄影現場兩位主持人坐太近，兩支麥一起推上去聲音發悶。L = A 麥、R = B 麥（PM5D 用 MIX PAN 一左一右送），
+# 接節目 L/R 時則是監看節目有沒有反相。只在 display_mode == "phase" 時由主迴圈每幀呼叫，跟 Spectrum 一樣不開執行緒。
+_PHASE_SILENT_DB  = -60.0        # 低於這個視為沒訊號（整體用 RMS dBFS、分頻用 Spectrum 同一套 dBFS 校準）
+_PHASE_MIN_FRAMES = int(3.0 * FPS)                      # MIN (3")：假設穩定 FPS，同 peak hold 的做法
+_PHASE_BAND_ALPHA = 1 - math.exp(-1 / (0.5 * FPS))      # 分頻數值平滑，時間常數 0.5 秒（低頻段 bin 少，不平滑會亂跳）
+_NOTCH_FLOOR_DB   = -30.0
+_NOTCH_BOX_DB     = -3.0         # NOTCH 低於這個才在 BAND 頁框出頻段（使用者 2026-11-25 指定）
+_NOTCH_BANDS      = [i for i, (fc, _, _) in enumerate(OCTAVE_BANDS) if 100 <= fc <= 8000]   # 人聲範圍
+
+_phase_min_q  = collections.deque(maxlen=_PHASE_MIN_FRAMES)
+_phase_band_s = np.zeros((3, len(OCTAVE_BANDS)))        # 平滑後的各頻段 [ΣL², ΣR², Re ΣLR*]
+
+
+def compute_phase(bands=True):
+    """回傳 PHASE 畫面要的數字（沒訊號的項目是 None）。bands=False（GONIO 頁）時不算分頻（省 Pi 約 4 ms／幀），
+    band／notch 維持 None；切到 BAND 頁後平滑值約 1 秒內追上。
+    corr     最近 0.4 秒 L/R 相關係數 −1～+1（原始波形，不加 K-weighting）
+    min3     最近 3 秒 corr 的最低值——反相只閃一下也留得住
+    bal      L/R 音量差字串："L 3"＝L 大 3 dB、"0"、只有一邊有訊號時 "L"／"R"
+    band     各 1/3 八度頻段的相關係數（任一邊沒訊號的頻段是 None）
+    notch    兩支一起推時，100 Hz～8 kHz 內被吃掉最多的頻段少了幾 dB（相對兩路功率直接相加），封頂 −30
+             |L+R|² = |L|² + |R|² + 2·Re(LR*)，所以 gain = 10·log10(1 + 2·Re(LR*) / (|L|²+|R|²))：
+             同相同音量 +3、不相關 0、反相 −∞；同時反映「像不像」和「大聲差多少」，不用假設 B 是 A 的延遲版本
+    notch_i  上面那個頻段的索引（畫面加黃框）"""
+    out = {"corr": None, "min3": None, "bal": None, "band": [None] * len(OCTAVE_BANDS), "notch": None, "notch_i": None}
+    m = list(buf_m_chunks)
+    if len(m) < M_BLOCKS:
+        return out
+    a = np.concatenate(m).astype(np.float64)
+    l, r = a[:, 0], a[:, 1]
+    sxx, syy, sxy = float(l @ l), float(r @ r), float(l @ r)
+    db_l = 10 * math.log10(sxx / len(a) + 1e-20)
+    db_r = 10 * math.log10(syy / len(a) + 1e-20)
+    on_l, on_r = db_l >= _PHASE_SILENT_DB, db_r >= _PHASE_SILENT_DB
+    if on_l and on_r:
+        out["corr"] = sxy / math.sqrt(sxx * syy)
+        d = round(db_l - db_r)
+        out["bal"] = "0" if d == 0 else (f"L {d}" if d > 0 else f"R {-d}")
+    elif on_l or on_r:
+        out["corr"] = 0.0      # 只有一邊有訊號：不相關，不拿另一邊的底噪去算
+        out["bal"]  = "L" if on_l else "R"
+    if out["corr"] is not None:
+        _phase_min_q.append(out["corr"])
+        out["min3"] = min(_phase_min_q)
+
+    s = list(buf_s_chunks)[-(SPECTRUM_FFT_SIZE // BLOCK_SIZE + 1):]   # 只接需要的 4 個 block，不接整整 3 秒
+    if not bands or len(s) * BLOCK_SIZE < SPECTRUM_FFT_SIZE:
+        return out
+    win = np.concatenate(s)[-SPECTRUM_FFT_SIZE:]
+    A = np.fft.rfft(win[:, 0] * _HANN_WINDOW)
+    B = np.fft.rfft(win[:, 1] * _HANN_WINDOW)
+    pxx, pyy, pxy = A.real ** 2 + A.imag ** 2, B.real ** 2 + B.imag ** 2, (A * B.conj()).real
+    now = np.array([[float(np.sum(p[lo:hi])) for _, lo, hi in OCTAVE_BANDS] for p in (pxx, pyy, pxy)])
+    _phase_band_s[:] += _PHASE_BAND_ALPHA * (now - _phase_band_s)
+    bxx, byy, bxy = _phase_band_s
+    floor = _DBFS_REF * 10 ** (_PHASE_SILENT_DB / 10)
+    for i in range(len(OCTAVE_BANDS)):
+        if bxx[i] >= floor and byy[i] >= floor:
+            out["band"][i] = bxy[i] / math.sqrt(bxx[i] * byy[i])
+            if i in _NOTCH_BANDS:
+                g = 10 * math.log10(max(1 + 2 * bxy[i] / (bxx[i] + byy[i]), 1e-6))
+                if out["notch"] is None or g < out["notch"]:
+                    out["notch"], out["notch_i"] = g, i
+    if out["notch"] is not None:
+        out["notch"] = max(out["notch"], _NOTCH_FLOOR_DB)
+    return out
+
+
 _AXIS_ALPHA = 153   # 軸文字 60% 不透明：字壓在 bar 上時 bar 的顏色透得出來
 
 
@@ -869,7 +948,165 @@ def draw_spectrum_screen(surface, fonts, surf_cache, W, H, vals, band_levels, pe
                         highlight_index=freq_idx, peak_levels=peaks)
 
 
-_DISPLAY_CYCLE = ("loudness", "spectrum", "histogram")
+_CORR_REFS  = ("-1.00", "---")
+_NOTCH_REFS = ("-30", "---")
+_BAL_REFS   = ("L 40", "---")
+_GREEN, _RED, _YELLOW = (50, 200, 80), (220, 50, 50), (220, 200, 50)
+_gon = {"surf": None, "gain": None}   # goniometer 殘影層（跨幀保留）與自動縮放倍率
+
+
+def _fmt_corr(c):
+    return "---" if c is None else f"{c:.2f}".replace("-0.00", "0.00")
+
+
+def _corr_color(c):
+    return (255, 255, 255) if c is None else (_GREEN if c >= 0 else _RED)
+
+
+def _notch_color(n):
+    # 門檻為本系統自訂（EBU 沒有規定）：−6 dB 以內聽不太出來、−12 以下明顯發悶
+    return (255, 255, 255) if n is None else (_GREEN if n > -6 else (_YELLOW if n > -12 else _RED))
+
+
+def _phase_title(surface, surf_cache, font_title, text, px, pw, py):
+    key = ('phase_title', text)
+    if key not in surf_cache:
+        surf_cache[key] = font_title.render(text, True, (170, 170, 170))
+    t = surf_cache[key]
+    surface.blit(t, (px + pw // 2 - t.get_width() // 2, py + 8))
+
+
+def _draw_goniometer(surface, surf_cache, font_axis, x0, y0, size):
+    """Lissajous／Phase Scope：相鄰取樣點連成線、殘影、自動縮放（同 Decibel 的畫法）。
+    每幀畫最新一個 block（2400 點 = 50 ms，20 FPS 剛好每個取樣點都畫到）。Pi 實測 2400 點整張畫面 17.7 ms；
+    不用 aalines（Pi 實測貴 2.5 倍）。轉 45°：單獨 L 是往左上的斜線、單獨 R 往右上、同相直立、反相橫躺。"""
+    surf = _gon["surf"]
+    if surf is None or surf.get_width() != size:
+        surf = _gon["surf"] = pygame.Surface((size, size))
+        _gon["fade"] = pygame.Surface((size, size))
+        _gon["fade"].set_alpha(56)                  # 黑色 56/255 蓋一層 = 每幀亮度 ×0.78
+    # 殘影：蓋半透明黑色（Pi 實測 2.0 ms），不用 fill(BLEND_RGB_MULT)（同效果 8.4 ms，是整頁最大項）
+    ta = time.perf_counter()
+    surf.blit(_gon["fade"], (0, 0))
+    tb = tc = td = time.perf_counter()
+    # 輔助線畫在殘影層、訊號線之前：反相（橫線）、單聲道（斜線）的訊號剛好跟輔助線重疊，後畫會被蓋掉
+    c, e = (45, 45, 45), size - 1
+    for p, q in (((e // 2, 0), (e // 2, e)), ((0, e // 2), (e, e // 2)), ((0, 0), (e, e)), ((e, 0), (0, e))):
+        pygame.draw.line(surf, c, p, q)
+    pygame.draw.rect(surf, c, (0, 0, size, size), 1)
+    half = size / 2
+    if buf_s_chunks:
+        blk = buf_s_chunks[-1].astype(np.float64)
+        l, r = blk[:, 0], blk[:, 1]
+        pk = math.sqrt(float(np.max(l * l + r * r)))
+        if 20 * math.log10(pk + 1e-12) >= _PHASE_SILENT_DB:
+            # 自動縮放：變大立刻縮、變小慢慢放大（約 1 秒放大一倍）；最多放大到 −40 dBFS 填滿，不把底噪放大成一團
+            target = min(0.9 * half / pk, 0.9 * half / 10 ** (-40 / 20))
+            g = _gon["gain"]
+            _gon["gain"] = g = target if g is None or target < g else min(target, g * 1.035)
+            k = g * 0.70710678
+            tb = time.perf_counter()
+            pts = np.column_stack((half + (r - l) * k, half - (l + r) * k)).tolist()
+            tc = time.perf_counter()
+            pygame.draw.lines(surf, (110, 220, 240), False, pts)
+            td = time.perf_counter()
+    surface.blit(surf, (x0, y0))
+    _gon["t"] = (tb - ta, tc - tb, td - tc, time.perf_counter() - td)   # 診斷：殘影／算點／連線／貼圖
+    for text, ax in (("L", x0 + 6), ("M", None), ("R", None)):
+        lab = _axis_label(surf_cache, font_axis, text)
+        x = ax if ax is not None else (x0 + size // 2 - lab.get_width() // 2 if text == "M" else x0 + size - lab.get_width() - 6)
+        surface.blit(lab, (x, y0 + 4))
+
+
+def _draw_band_corr(surface, surf_cache, font_axis, band, notch_i, px, pw, top, bottom):
+    """分頻 correlation：0 為中線，往上綠、往下紅；凹口最深的頻段加黃框。X 軸同 Spectrum。"""
+    MARGIN = 4
+    n = len(band)
+    zone_h = bottom - top
+    area_w = pw - MARGIN * 2
+    bar_w  = max(2, (area_w - MARGIN * (n - 1)) // n)
+    xc     = [px + MARGIN + i * (bar_w + MARGIN) + bar_w // 2 for i in range(n)]
+    x_lab  = [(xc[i], text) for i, text in _SPECTRUM_XLABELS if i < n]
+    mid    = top + zone_h // 2
+    pygame.draw.rect(surface, (28, 28, 28), (px + MARGIN, top, area_w, zone_h))
+    _draw_vguides(surface, [x for x, _ in x_lab], top, bottom)
+    for v in (1.0, 0.5, -0.5, -1.0):
+        y = mid - int(v * (zone_h // 2 - 2))
+        pygame.draw.line(surface, (70, 70, 70), (px + MARGIN, y), (px + MARGIN + area_w, y), 1)
+    for i, c in enumerate(band):
+        if c is None:
+            continue
+        bx = px + MARGIN + i * (bar_w + MARGIN)
+        bh = int(abs(c) * (zone_h // 2 - 2))
+        pygame.draw.rect(surface, (60, 140, 90) if c >= 0 else (200, 60, 60), (bx, mid - bh if c >= 0 else mid, bar_w, bh))
+    pygame.draw.line(surface, (200, 200, 200), (px + MARGIN, mid), (px + MARGIN + area_w, mid), 2)
+    if notch_i is not None:
+        bx = px + MARGIN + notch_i * (bar_w + MARGIN)
+        pygame.draw.rect(surface, _YELLOW, (bx - 2, top, bar_w + 4, zone_h), 3)
+    for text, v in (("+1", 1.0), ("0", 0.0), ("-1", -1.0)):
+        lab = _axis_label(surf_cache, font_axis, text)
+        y = max(top, min(bottom - lab.get_height(), mid - int(v * (zone_h // 2 - 2)) - lab.get_height() // 2))
+        surface.blit(lab, (px + MARGIN + 2, y))
+        surface.blit(lab, (px + pw - MARGIN - lab.get_width() - 2, y))
+    _draw_x_labels(surface, surf_cache, font_axis, x_lab, px, pw, bottom, MARGIN)
+
+
+def _draw_corr_bar(surface, surf_cache, font_axis, corr, px, pw, y, h):
+    """底部 correlation 指針條：從 0 往實際值填色（正綠負紅），遠看也清楚。"""
+    MARGIN = 4
+    x0, w = px + MARGIN, pw - MARGIN * 2
+    pygame.draw.rect(surface, (28, 28, 28), (x0, y, w, h))
+    cx = x0 + w // 2
+    if corr is not None:
+        xv = cx + int(corr * (w // 2))
+        pygame.draw.rect(surface, _corr_color(corr), (min(cx, xv), y + 4, max(3, abs(xv - cx)), h - 8))
+    pygame.draw.line(surface, (200, 200, 200), (cx, y), (cx, y + h - 1), 2)
+    for text, x in (("-1", x0 + 4), ("+1", None)):
+        lab = _axis_label(surf_cache, font_axis, text)
+        surface.blit(lab, (x if x is not None else x0 + w - lab.get_width() - 4, y + (h - lab.get_height()) // 2))
+
+
+def draw_phase_screen(surface, fonts, surf_cache, W, H, ph, view):
+    """PHASE 畫面：左欄三格數字＋右側主圖＋底部 correlation 指針條，版面同 Spectrum／Histogram。
+    GONIO 頁（看極性）：CORR／MIN (3")／BAL ＋ goniometer
+    BAND 頁（看悶聲）：CORR／NOTCH dB／BAL ＋ 分頻 correlation。MIN 換成 NOTCH：梳狀濾波的整體 corr 不會掉成負值
+    （測試音第 7 段 +0.13），MIN 在這頁沒用；BAL 留著，因為它解釋凹口為什麼深（一樣大聲才會深）。"""
+    font_title, font_axis = fonts[0], fonts[1]
+    left_w  = W // 5
+    third_h = H // 3
+    draw_number_only_panel(surface, fonts, surf_cache, "CORR", None, 0, left_w, 0, third_h,
+                           val_str=_fmt_corr(ph["corr"]), num_color=_corr_color(ph["corr"]), ref_strs=_CORR_REFS)
+    if view == "gonio":
+        draw_number_only_panel(surface, fonts, surf_cache, 'MIN (3")', None, 0, left_w, third_h, third_h,
+                               val_str=_fmt_corr(ph["min3"]), num_color=_corr_color(ph["min3"]), ref_strs=_CORR_REFS)
+    else:
+        n = ph["notch"]
+        draw_number_only_panel(surface, fonts, surf_cache, "NOTCH dB", None, 0, left_w, third_h, third_h,
+                               val_str="---" if n is None else str(round(n)), num_color=_notch_color(n), ref_strs=_NOTCH_REFS)
+    draw_number_only_panel(surface, fonts, surf_cache, "BAL dB", None, 0, left_w, 2 * third_h, H - 2 * third_h,
+                           val_str=ph["bal"] or "---", num_color=(255, 255, 255), ref_strs=_BAL_REFS)
+    for i in (1, 2):
+        pygame.draw.line(surface, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
+    pygame.draw.line(surface, (55, 55, 55), (left_w, 0), (left_w, H), 1)
+
+    px, pw = left_w, W - left_w
+    TITLE_H = 50
+    bar_h   = font_axis.get_height() + 12
+    bar_y   = H - bar_h - 4
+    top, bottom = TITLE_H, bar_y - 8
+    if view == "gonio":
+        _phase_title(surface, surf_cache, font_title, "GONIOMETER", px, pw, 0)
+        size = min(pw - 8, bottom - top - 8)
+        _draw_goniometer(surface, surf_cache, font_axis, px + (pw - size) // 2, top + 8, size)
+    else:
+        _phase_title(surface, surf_cache, font_title, "BAND CORRELATION", px, pw, 0)
+        # 黃框＝被吃掉最多的頻段；NOTCH 不到 −3 dB 不框（同相時每頻段都 +3、不相關時在 0 附近亂跳，框了沒意義）
+        box = ph["notch_i"] if ph["notch"] is not None and ph["notch"] < _NOTCH_BOX_DB else None
+        _draw_band_corr(surface, surf_cache, font_axis, ph["band"], box, px, pw, top, bottom)
+    _draw_corr_bar(surface, surf_cache, font_axis, ph["corr"], px, pw, bar_y, bar_h)
+
+
+_DISPLAY_CYCLE = ("loudness", "spectrum", "histogram", "phase")
 
 
 def _toggle_display_mode():
@@ -886,8 +1123,12 @@ def _step_freq(delta):
     清單最後一格（BYPASS_INDEX）代表「不選定特定頻段」，純顯示狀態（BAND dBFS／
     BAND FREQ 顯示 ---／ALL），不影響任何音訊處理——Pi 本來就不輸出音訊。
     純粹更新 freq_index，不做任何運算，停在哪一格完全零成本。"""
-    global freq_index, hist_mode
+    global freq_index, hist_mode, phase_view
     pin = GPIO_PIN_FREQ_PREV if delta < 0 else GPIO_PIN_FREQ_NEXT
+    if display_mode == "phase":       # 同 Histogram：只有兩頁，兩顆都切換
+        phase_view = "band" if phase_view == "gonio" else "gonio"
+        print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> phase_view={phase_view}", flush=True)
+        return
     if display_mode == "histogram":
         hist_mode = "slide" if hist_mode == "hour" else "hour"
         print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> hist_mode={hist_mode}", flush=True)
@@ -901,6 +1142,146 @@ def _step_freq(delta):
         return
     f_center = OCTAVE_BANDS[freq_index][0]
     print(f"[GPIO DEBUG] step_freq fired (GPIO{pin}, delta={delta}) -> freq_index={freq_index}, f_center={f_center}Hz", flush=True)
+
+
+def _set_display_mode(name):
+    """直接跳到指定畫面（手機網頁用）。GPIO KEY 9 仍走 _toggle_display_mode 循環，行為不變。"""
+    global display_mode
+    if name in _DISPLAY_CYCLE:
+        display_mode = name
+        print(f"[WEB] display_mode={display_mode}", flush=True)
+
+
+# ─── 手機網頁操作（2026-11-25） ───────────────────────────────────────────────
+# 手機連 Pi 的 Wi-Fi 熱點 MeterOnPi，開 http://10.42.0.1:8080 。沒有 PM5D GPI 時的替代操作。
+# 只用 stdlib；handler 只改上面那幾個全域變數（跟 GPIO 回呼一樣，賦值是 GIL 原子操作），
+# 不畫圖、不運算，不會卡住音訊 callback。
+# 沒有密碼：熱點的 WPA 密碼就是門禁。⚠ 綁 0.0.0.0，eth0 若接上公司網路，同網段的人也打得到，到時要另加限制。
+_WEB_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Meter 遙控</title><style>
+body{margin:0;padding:16px;background:#111;color:#ddd;font:18px system-ui,sans-serif}
+#st{font-size:22px;text-align:center;margin:8px 0 16px;color:#8cf}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+button{font:inherit;font-size:22px;padding:28px 8px;border:2px solid #444;border-radius:14px;
+background:#222;color:#eee;touch-action:manipulation}
+button.on{background:#2a6;border-color:#4c8;color:#fff}button:disabled{color:#555;border-color:#2a2a2a}
+</style></head><body><div id="st">連線中…</div>
+<div class="g"><button data-m="loudness">Loudness</button><button data-m="spectrum">Spectrum</button>
+<button data-m="histogram">Histogram</button><button data-m="phase">PHASE</button></div>
+<div class="g"><button id="prev">—</button><button id="next">—</button></div>
+<script>
+const N={loudness:"Loudness",spectrum:"Spectrum",histogram:"Histogram",phase:"PHASE"};
+const prev=document.getElementById("prev"),next=document.getElementById("next"),st=document.getElementById("st");
+async function call(p,o){try{show(await (await fetch(p,o)).json())}catch(e){st.textContent="連線中斷，重試中…"}}
+function show(s){
+ document.querySelectorAll("[data-m]").forEach(b=>b.classList.toggle("on",b.dataset.m==s.mode));
+ let a="不作用",b=a,i="";
+ if(s.mode=="spectrum"){a="◀ 往低頻";b="往高頻 ▶";i="頻段 "+s.freq}
+ else if(s.mode=="histogram"){a=b="切換範圍";i=s.hist_mode=="hour"?"這一小時":"最近 "+s.slide_min+" 分鐘"}
+ else if(s.mode=="phase"){a=b=s.phase_view=="gonio"?"切到 BAND":"切到 GONIO";i=s.phase_view.toUpperCase()}
+ prev.textContent=a;next.textContent=b;prev.disabled=next.disabled=s.mode=="loudness";
+ st.textContent=N[s.mode]+(i?"｜"+i:"")}
+document.querySelectorAll("[data-m]").forEach(b=>b.onclick=()=>call("/mode/"+b.dataset.m,{method:"POST"}));
+prev.onclick=()=>call("/prev",{method:"POST"});next.onclick=()=>call("/next",{method:"POST"});
+call("/state");setInterval(()=>call("/state"),1500);  // 輪詢：實體 KEY 9 按下時手機也會同步
+</script></body></html>"""
+
+
+def _web_state():
+    fc = None if freq_index == BYPASS_INDEX else OCTAVE_BANDS[freq_index][0]
+    return {"mode": display_mode, "phase_view": phase_view, "hist_mode": hist_mode, "slide_min": _TL_SLIDE_MIN,
+            "freq": "ALL" if fc is None else (f"{fc:g} Hz" if fc < 1000 else f"{fc / 1000:g} kHz")}
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(200, _WEB_HTML, "text/html; charset=utf-8")
+        elif self.path == "/state":
+            self._send(200, json.dumps(_web_state()))
+        else:
+            self._send(404, "{}")
+
+    def do_POST(self):
+        if self.path.startswith("/mode/") and self.path[6:] in _DISPLAY_CYCLE:
+            _set_display_mode(self.path[6:])
+        elif self.path in ("/prev", "/next"):
+            _step_freq(-1 if self.path == "/prev" else 1)   # 等同 KEY 10／11（log 一樣印 GPIO 編號）
+        else:
+            return self._send(404, "{}")
+        self._send(200, json.dumps(_web_state()))
+
+    def log_message(self, *args):
+        pass   # 不印每個請求：手機每 1.5 秒輪詢一次，會灌爆 /tmp/lm.log（tmpfs，吃 RAM）
+
+
+def start_web_server():
+    """背景開手機網頁。LM_WEB_PORT 改 port、設 0 停用；綁不起來只印一行警告，響度計照常運作。"""
+    try:
+        port = int(os.environ.get("LM_WEB_PORT", "8080"))
+        if port == 0:
+            return None
+        srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), _WebHandler)
+    except (OSError, ValueError) as e:
+        print(f"[WEB] phone control disabled: {e}", flush=True)
+        return None
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[WEB] phone control on port {srv.server_address[1]}", flush=True)
+    return srv
+
+
+_phase_log_t = [0.0]
+
+
+def _log_phase(ph):
+    """PHASE 實測紀錄（2026-11-25 雙麥克風座談用）：在 PHASE 畫面每 2 秒印一行到 /tmp/lm.log，附時間（log 本身沒時間戳）。
+    格式：[PHASE] 時:分:秒 corr min3 bal notch@頻段 | 100 Hz～8 kHz 各頻段 correlation（×10 取整，. ＝ 沒訊號）。
+    每行約 150 字、20 分鐘約 90 KB（/tmp 是 tmpfs 吃 RAM，量很小）。ponytail: 實測用，分析完可以拿掉"""
+    now = time.monotonic()
+    if now - _phase_log_t[0] < 2.0:
+        return
+    _phase_log_t[0] = now
+    f = lambda v: "---" if v is None else f"{v:+.2f}"
+    n = "---" if ph["notch"] is None else f"{ph['notch']:.1f}@{OCTAVE_BANDS[ph['notch_i']][0]:g}"
+    bands = " ".join("." if ph["band"][i] is None else f"{round(ph['band'][i] * 10):+d}" for i in _NOTCH_BANDS)
+    print(f"[PHASE] {datetime.datetime.now():%H:%M:%S} {phase_view} corr {f(ph['corr'])} min3 {f(ph['min3'])} "
+          f"bal {ph['bal'] or '---'} notch {n} | {bands}", flush=True)
+
+
+_fs = {"t": time.monotonic(), "n": 0, "sum": 0.0, "max": 0.0, "info": ""}
+
+
+def _frame_stat(mode, draw, flip):
+    """診斷（2026-11-25，追 PHASE GONIO 頁每分鐘約 8 次 input overflow；離屏量每幀才 14.5 ms，正式畫面上一定有
+    別的東西變慢）：每分鐘印一行——該分鐘最慢一幀的畫圖／flip 耗時（GONIO 頁再拆殘影／算點／連線／貼圖）、
+    callback 最長間隔。只在 PHASE 畫面、或有異常（幀 ≥ 40 ms、callback 間隔 ≥ 100 ms）時印，平常不灌 log。
+    ponytail: 診斷用，查清楚後可以拿掉"""
+    global _cb_gap_max
+    tot = draw + flip
+    _fs["n"] += 1
+    _fs["sum"] += tot
+    if tot > _fs["max"]:
+        _fs["max"] = tot
+        g = _gon.get("t") if mode == "phase" and phase_view == "gonio" else None
+        _fs["info"] = f"draw {draw * 1000:.1f} flip {flip * 1000:.1f}" + (
+            "" if g is None else " gon fade/pts/lines/blit " + "/".join(f"{x * 1000:.1f}" for x in g))
+    now = time.monotonic()
+    if now - _fs["t"] >= 60:
+        if mode == "phase" or _fs["max"] >= 0.04 or _cb_gap_max >= 0.1:
+            print(f"[FRAME] {mode}/{phase_view if mode == 'phase' else '-'} n={_fs['n']} avg {_fs['sum'] / _fs['n'] * 1000:.1f}"
+                  f" max {_fs['max'] * 1000:.1f} ms ({_fs['info']}) cb_gap_max {_cb_gap_max * 1000:.0f} ms", flush=True)
+        _fs.update(t=now, n=0, sum=0.0, max=0.0, info="")
+        _cb_gap_max = 0.0
 
 
 def _log_cache(surf_cache):
@@ -957,6 +1338,9 @@ def warm_glyph_cache(fonts, surf_cache, W, H):
                          [_SPECTRUM_DBFS_LO] * len(OCTAVE_BANDS), _spectrum_peaks, 0)
     for mode in ("hour", "slide"):
         draw_histogram_screen(warm, fonts, surf_cache, W, H, mode, 0, dummy)
+    ph = {"corr": None, "min3": None, "bal": None, "band": [None] * len(OCTAVE_BANDS), "notch": None, "notch_i": None}
+    for view in ("gonio", "band"):
+        draw_phase_screen(warm, fonts, surf_cache, W, H, ph, view)
 
 
 def main():
@@ -1004,6 +1388,8 @@ def main():
     signal.signal(signal.SIGUSR2, lambda sig, frame: _step_freq(-1))
     signal.signal(signal.SIGHUP, lambda sig, frame: _toggle_display_mode())
 
+    start_web_server()   # 手機網頁（熱點 10.42.0.1:8080）
+
     # 單工輸入 stream——耳機監聽改回 Scarlett 硬體 Direct Monitor（零延遲），
     # Pi 只做分析／顯示，不輸出任何音訊。
     stream = sd.InputStream(
@@ -1014,6 +1400,10 @@ def main():
 
     t_warm = time.monotonic()
     warm_glyph_cache(fonts, surf_cache, W, H)       # 一定要在 `with stream:` 之前，見 docstring
+    # 開機物件全部標成「不用再掃」：之後 Python 的全面垃圾回收只掃新物件。2026-11-25 PHASE GONIO 頁每幀 tolist()
+    # 2400 點會頻繁觸發全面回收，正式程式物件多、一次掃 87～167 ms，期間持有 GIL 卡住 audio callback（每分鐘約
+    # 8 次 overflow）；freeze 後 Pi 實測全面回收最長 1.7 ms。
+    gc.freeze()
     print(f"glyph cache warmed: {len(surf_cache)} entries in {time.monotonic() - t_warm:.2f}s", flush=True)
 
     with stream:
@@ -1046,6 +1436,7 @@ def main():
                 _log_cache(surf_cache)
                 cache_log_time = now_t + 600.0
 
+            t_draw = time.perf_counter()
             screen.fill((15, 15, 15))
 
             with lock:
@@ -1055,12 +1446,18 @@ def main():
                 draw_loudness_screen(screen, fonts, surf_cache, W, H, vals, current_hour, prev_H, prev_SEG)
             elif display_mode == "histogram":
                 draw_histogram_screen(screen, fonts, surf_cache, W, H, hist_mode, current_hour, vals)
+            elif display_mode == "phase":
+                ph = compute_phase(phase_view == "band")
+                draw_phase_screen(screen, fonts, surf_cache, W, H, ph, phase_view)
+                _log_phase(ph)
             else:
                 band_levels = compute_spectrum_bands()
                 _update_spectrum_peaks(band_levels)
                 draw_spectrum_screen(screen, fonts, surf_cache, W, H, vals, band_levels, _spectrum_peaks, freq_index)
 
+            t_flip = time.perf_counter()
             pygame.display.flip()
+            _frame_stat(display_mode, t_flip - t_draw, time.perf_counter() - t_flip)
             # 主執行緒每幀成本（fill／flip／數字格）隨幀率成比例，降幀率是最便宜的降載手段。
             # 代價：KEY 切換的畫面反應最長慢一幀（Loudness 100ms、Histogram 200ms）
             clock.tick(_SCREEN_FPS[display_mode])

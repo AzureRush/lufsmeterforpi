@@ -2,7 +2,135 @@
 
 紀錄 spec 沒有明確寫出的決策、trade-off、以及排錯過程中發現但文件沒提到的事。完整的分階段設計決策見 `C:\Users\User\.claude\plans\gpi-out-imperative-phoenix.md`（Plan Mode 產出，含 GPIO Spectrum Analyzer 功能的完整規劃與逐階段驗證紀錄）。這份檔案只記錄該計劃執行過程中，實際上機才發現、需要額外說明的部分。
 
-## 2026-11-24：手機切換畫面——Wi-Fi 熱點（準備中，尚未上機）
+## 2026-11-25 11:05：手機網頁操作（筆電完成，尚未上 Pi、未 commit）
+
+手機連熱點 `MeterOnPi` → http://10.42.0.1:8080 。程式在 `loudness_meter.py` 的「手機網頁操作」段落，`main()` 裡 `start_web_server()`。
+
+**spec 沒寫、我做的決定：**
+- 只用 stdlib `http.server.ThreadingHTTPServer`（daemon 執行緒），不加 Flask 之類的相依：Pi 現場沒網路，venv 多一個套件就多一次離線安裝的麻煩
+- handler 只改全域變數（`display_mode`／`phase_view`／`hist_mode`／`freq_index`），跟 GPIO 回呼同一種做法（賦值是 GIL 原子操作），不畫圖、不運算。socket I/O 會釋放 GIL，每次請求只有一個小 JSON，不會卡音訊 callback
+- 四顆畫面鈕用新的 `_set_display_mode(name)` **直接跳轉**；KEY 9 仍走 `_toggle_display_mode` 循環，行為不變。KEY 10／11 兩顆直接呼叫 `_step_freq(±1)`，所以 log 一樣印 `[GPIO DEBUG] step_freq fired (GPIO27/22…)`——從網頁按的也印 GPIO 編號，沒有另外區分（不改既有函式；主 session 的監測腳本也是解析這串字）
+- 按鈕文字由前端依 `/state` 決定（Spectrum 往低／高頻、Histogram 切換範圍、PHASE 切到 BAND／GONIO、Loudness 變灰）。頁面每 1.5 秒輪詢 `/state`，PM5D 按 KEY 9 時手機也會同步
+- port 8080（非 root 不能開 80）、綁 `0.0.0.0`；`LM_WEB_PORT` 改 port、`0` 停用、格式錯或綁不起來只印一行 `[WEB] phone control disabled: …`，響度計照常運作。**`0` 被拿來當停用，所以沒辦法用「port 0＝隨機 port」**
+- **沒有密碼**：熱點 WPA 密碼就是門禁。⚠ 綁 0.0.0.0，eth0 若接上公司網路，同網段的人也能切畫面，到時要改成只綁 10.42.0.1 或加限制（Pi OS 預設沒有防火牆）
+- `log_message` 關掉：輪詢每 1.5 秒一次，會灌爆 `/tmp/lm.log`（tmpfs，吃 RAM）
+- 沒做的：沒有 HTTPS、沒有登入、沒有 PWA／加到主畫面圖示
+
+**驗證**（筆電 benchvenv）：
+- `tools/check_web.py`：`LM_WEB_PORT=0`／`abc` 停用不崩潰；在 18080 起 server，`/`、`/state`、四個 `/mode/*`、Loudness 下 `/next` 不作用、Spectrum 往高頻 → 31.5 Hz、往低兩格繞到 ALL、Histogram → slide、PHASE band↔gonio、模擬 KEY 9 後 `/state` 同步、壞路徑回 404，全過
+- 頁面 JS：`node --check` 通過；用假 DOM 跑 `show()`，四種畫面的狀態列與按鈕文字、停用狀態都正確。**沒有開真的瀏覽器看版面**（記憶中「暫停 Claude Browser」），上 Pi 後用手機實際看
+- `check_phase.py` 8 段全過；Loudness／Spectrum／Histogram 兩模式 md5 與改版前相同
+
+## 2026-11-25 16:06：雙麥克風座談實測分析
+
+- 13:35～14:06 有訊號 521 筆（約 17 分鐘）。幾乎全是 MIC1（R）主講：BAL（R−L）5～95 百分位 11～17 dB、中位 15 dB。MIC2 單獨講話只有 13:42、13:56、13:59、14:01～14:02 幾小段，且那時 R 低於 −60 dB（只有 L），推測 MIC1 那時是關著的，沒辦法量 MIC2 講話時漏進 MIC1 的情況
+- **NOTCH 跟理論吻合**：兩路相加時最深的凹口受音量差限制，理論最深 = 10·log10((1−g)²/(1+g²))，g = 10^(−BAL/20)。BAL 12 → −2.8、15 → −1.8。實測 |BAL| 12～15：中位 −1.1、最深 −2.6；15～18：中位 −0.9、最深 −2.3。全場沒有低於 −3
+- **從分頻 correlation 反推延遲**：MIC1 主講且 BAL ≥ 12 時，各頻段 corr 平均值（125 −0.55、160 +0.44、200 +0.67、250 −0.45、315 −0.27…，400 Hz 以上趨近 0）擬合「1/3 八度內平均的 cos(2πfτ)」，最佳 **τ ≈ 5.35 ms ≈ 1.8 m**（聲音到 MIC2 比到 MIC1 多走約 1.8 m），振幅 0.83。400 Hz 以上趨近 0 是因為梳齒間距（約 187 Hz）比 1/3 八度頻寬窄，頻段內正負抵銷——不是沒有梳狀濾波，是解析度看不出來。這是估計值（擬合殘差 0.106），腳本 `field_tests/20261125_panel/analyze_delay.py`
+- 範例截圖 `field_tests/20261125_panel/panel_examples.png`
+- 注意：量的是 PRE EQ 的送出比例，PGM 實際凹口要看兩支推桿的相對位置
+
+## 2026-11-25 14:07：雙麥克風座談實測（資料已撈回，詳細分析待做）
+
+- 12:56 部署：黃框 NOTCH < −3 才框＋`[PHASE]` 實測紀錄（PHASE 畫面每 2 秒一行：時間／頁／corr／min3／bal／notch@頻段／100 Hz～8 kHz 各頻段 corr×10）。順手校時：移機斷電後 Pi 慢 10 分 18 秒（沒 RTC，開機時間停在關機那刻）
+- 移機後首次開機驗證：開機自動啟動 OK、1280x720@60、熱點與網頁 OK、0 overflow
+- 錄製 12:58～14:05（座談約 13:42～14:02），路由 L＝MIC2、R＝MIC1；13:44 起每分鐘 BAND＋GONIO 各一張 PNG（使用者問 GONIO 有沒有錄才加的，之前只有 BAND）。**全程 0 次 overflow**、cb_gap_max 56～58 ms
+- 資料：`field_tests/20261125_panel/`（`lm.log`＝完整 log、135 張 PNG、`analyze_panel.py` 分析腳本；**未加 .gitignore、未 commit**，要不要進 repo 待決定——截圖只有 meter 畫面，沒有節目內容）
+- 初步數字（還沒細看，使用者要回家再分析）：幾乎都是 R（MIC1）主講、L 漏音小 12 dB 以上；NOTCH 中位約 −1、最深 −2.6，**全場沒有一次低於 −3**；CORR 中位約 0、MIN3 最低 −0.78；分頻 125／250／315 Hz 平均負、160／200 Hz 平均正（延遲漏音的正負交錯）。MIC2 很少單獨講話，樣本少
+- 測完畫面切回 Loudness（PHASE 畫面會一直寫 `[PHASE]` 進 tmpfs）
+
+## 2026-11-25 11:47：移機前補上正式機的開機自動啟動與 720p
+
+- 使用者要移機、請我關機。關機前檢查發現：正式機（install.sh 之前手動架的）**沒有開機自動啟動**（`~/.config/autostart/` 不存在），`~/.config/kanshi/config` 是 0 byte 空檔（2026-04-13）→ 重開機後響度計不會起來、解析度會回到螢幕偏好的 1080p
+- 照 install.sh 補上（不用 sudo）：`~/.config/autostart/loudness_meter.desktop`（`run.sh --autostart`）、kanshi 兩個 HDMI profile 都 `1280x720@60Hz`。現行輸出確認是 HDMI-A-1「CAT-6066」1280x720@60
+- **使用者補充：現場 monitor 不支援 1080p60**——kanshi 設定檔是必要的，不能刪；README「已知限制」已改寫
+- 熱點 `meter-hotspot` 原本就是 autoconnect，開機會自己開
+- 關機要 sudo（只有 `/usr/bin/date` 免密碼），由使用者自己執行 `sudo shutdown -h now`
+- 移機後第一次開機要確認：螢幕是 720p、響度計自動起來（log `/tmp/lm.log`）、手機連得上網頁
+
+## 2026-11-25 11:45：BAND 頁黃框改成 NOTCH < −3 才顯示（**未部署**，下次部署一起上）
+
+- 黃框＝兩支一起推時被吃掉最多的頻段（NOTCH 的位置）。原本永遠框：完全同相時每頻段都 +3、兩邊不相關時 NOTCH 在 0 附近、黃框亂跳，都沒意義
+- 使用者指定門檻 −3（`_NOTCH_BOX_DB`）。只影響畫框，NOTCH 數字照常顯示。測試音：同相、不相關不框；梳狀濾波（−16）、正常擺位（−3.1）有框
+- goniometer 1 px 線寬：使用者在 LM6505 上看「還算可以」，不改
+
+## 2026-11-25 11:37：PHASE GONIO 頁 overflow 根因＝Python 全面垃圾回收，加 `gc.freeze()` 修好；手機網頁上線
+
+**經過**：
+- 11:03 雙麥克風實測（L＝MIC2、R＝MIC1）20 分鐘，**截圖全失敗**：Pi 上的 grim 沒編 JPEG（`jpeg support disabled`），我沒先試拍就開跑，現場測試無法重來（教訓已記進記憶）。CPU 每分鐘 57～61% 正常，但 log 每 64～80 秒一行 overflow（3～5 次）
+- 分段測（各 150 秒）：PHASE 切頁不截圖 約 9 次／PHASE GONIO 頁不動 約 20 次／Loudness＋每 10 秒 PNG 截圖 0 次 → 截圖無關，是 GONIO 頁本身；剛部署時 GONIO 20 秒 0 次是因為當時訊號左右相同、時間也短
+- 加診斷紀錄 `[FRAME]`（每分鐘一行：該分鐘最慢一幀的畫圖／flip，GONIO 再拆殘影／算點／連線／貼圖，以及 audio callback 最長間隔 `cb_gap_max`；只在 PHASE 或異常時印），跟手機網頁一起部署。結果：`gon fade/pts/lines/blit 4.2/86.9/1.9/1.1`、`cb_gap_max 120 ms`——**算點（`np.column_stack(...).tolist()`）偶爾暴衝到 87 ms**
+- 根因：每幀 tolist() 產生 2400 個 list（GC 追蹤的容器），每秒約 5 萬個，頻繁觸發 Python 的 gen2 全面回收；正式程式長壽物件多（快取、deque、模組），一次掃 87～167 ms、全程持有 GIL → callback 被擋 > 100 ms → overflow。離屏 bench 物件少所以沒抓到
+- Pi 離屏驗證（模擬 30 萬個長壽物件）：tolist 最慢 175 ms（gen2 3 次、最長 167 ms）／直接傳 ndarray 18.9 ms（0 次，但每點建 numpy 物件，單次呼叫變慢）／**tolist＋`gc.freeze()` 20.5 ms（gen2 最長 1.7 ms）**
+- 選 `gc.freeze()`：在 `warm_glyph_cache` 後呼叫一次，開機時的物件移到永久世代，之後全面回收只掃新物件。一行、官方建議用法、對所有畫面都有幫助。之後新長出來的物件（`_tl_q` 4000 筆、text_lru 等）仍會被掃，但量小
+- 修正後 GONIO 頁 2.5 分鐘：**0 次 overflow**、最慢一幀 27 ms、算點最慢 2.8 ms、`cb_gap_max 57 ms`（正常 50）。啟動後第一分鐘的 `cb_gap_max 1383 ms` 是 stream 剛開始，不是掉格
+- `[FRAME]` 診斷先留著（平常 Loudness 不印，只有 PHASE 或異常才印），確認長期穩定後可拿掉
+
+**部署**：手機網頁（fork 代理實作，見下一節）＋診斷＋gc.freeze 共重啟兩次（11:29、11:33），THIS HOUR 歸零兩次（使用者同意）。Pi 備份：`loudness_meter.py.bak_20261125_phase`（PHASE 首版）、`/tmp/lm.log.bak_20261125_phase`、`/tmp/lm.log.bak_20261125_web`。Pi 上 `ss -ltn` 確認 8080 在聽，`curl http://10.42.0.1:8080/state` 回 JSON 正常；Pi OS 沒有防火牆擋 8080。**使用者 Android 手機實按確認：網頁可用、按鈕都正常**（行動網路開著也行：10.42.0.x 是 Wi-Fi 直連網段，不會走行動網路）。
+
+## 2026-11-25 10:41：PHASE 上 Pi（連同選擇錄音介面版、新 run.sh 一起部署）
+
+- 部署前先在 Pi 的 `/tmp/lmtest` 離屏跑 `check_phase.py`（用 Pi 真正的 scipy／lufs_core）：8 段全過。量每幀：Loudness 9.0／Spectrum 10.8／**PHASE GONIO 25.4**／BAND 10.7 ms——GONIO 比 bench 的 17.7 多
+- 拆開量（Pi）：殘影 `fill(BLEND_RGB_MULT)` **8.4 ms** 最大項、`compute_phase` 4.6 ms（GONIO 頁也在算用不到的分頻，還把 3 秒 60 個 block 全接起來）、連線 2～4.5 ms
+- 兩個優化：① 殘影改成 blit 一張 alpha 56 的黑色 Surface（同樣 ×0.78），**2.0 ms**；兩種做法 200 幀後都歸零，不留殘影。② GONIO 頁不算分頻（`compute_phase(bands=False)`），分頻只接最後 4 個 block。→ **GONIO 14.5 ms**
+- 檢查腳本出圖的假殘影：`check_phase.py` 原本每段只畫一幀，殘影層只淡化一次，上一段的線會留著（正式程式每幀畫，不會有）。改成出圖前逐幀畫 1 秒
+- 部署：Pi 上備份 `loudness_meter.py.bak_20261125`、`run.sh.bak_20261125`、`/tmp/lm.log.bak_20261125`；`run.sh --restart` 首次上線，SSH 遠端執行沒有砍到自己。log 顯示 `Audio input: [2] Scarlett 2i2`（選擇錄音介面版正常）、預熱 50 張 1.06 秒
+- 實測 CPU（各 20 秒，有節目訊號）：**PHASE GONIO 54%／BAND 60%／Loudness 46%**（Spectrum 歷來約 60%），期間 0 次溢位，溫度 57.9°C。最後切回 Loudness 畫面
+- 現場訊號目前是 MONITOR 的單聲道內容：CORR +1.00、goniometer 直立一條線、BAND 全 +1、NOTCH +3，符合預期
+- 觀察到兩個可再調的地方（未改）：① 全部同相時 NOTCH 是 +3，黃框還是會框在某個頻段（最小的那個），沒有意義，可改成 NOTCH < 0 才框；② goniometer 1 px 線在 720p 輸出偏細，要看 LM6505 上實際觀感再決定要不要加粗（width=2 會多花時間）
+
+## 2026-11-25 10:33：PHASE 畫面實作（筆電完成，尚未上 Pi）
+
+使用者確認的規格：KEY 9 四畫面循環；左欄第一格標題 `CORR`；KEY 10／11 在 PHASE 切換 GONIO 頁 ↔ BAND 頁（兩顆都切換，同 Histogram）；凹口深度放 BAND 頁、取代 MIN，BAL 保留。
+
+**spec 沒寫、我做的決定：**
+- **NOTCH 的算法改掉了**：原本規劃用 BAL 推算（20·log((1+g)/(1−g))），但那只在「B 是 A 的延遲複本」時成立，兩支收不同聲音時 BAL 0 也會誤報。改成直接算每個頻段「兩路相加後」比「功率直接相加」差幾 dB：`10·log10(1 + 2·Re(LR*) / (|L|²+|R|²))`，取 100 Hz～8 kHz 最小值、封頂 −30。同相同音量 +3、不相關 0、反相 −∞，相關程度與音量比一起反映。跟原規劃的公式在「延遲複本」情況下數值一致（第 8 段 B 小 10 dB → −3）
+- NOTCH 顏色門檻（−6／−12）是**自訂**的，README 已註明
+- 整體 CORR／BAL 用 0.4 秒（`buf_m_chunks`，跟 MOMENTARY 同窗口）、原始波形不加 K-weighting；分頻用 Spectrum 同一套 8192 點 FFT＋Hann＋`_DBFS_REF`，各頻段 ΣL²／ΣR²／Re ΣLR* 指數平滑（時間常數 0.5 秒）：低頻段只有 1～4 個 bin，不平滑會亂跳
+- 沒訊號門檻 −60 dB：整體用 RMS dBFS、分頻用 Spectrum 的 dBFS 校準。兩邊都沒訊號顯示 `---`；只有一邊有訊號時 CORR 直接給 0（不拿另一邊的底噪去算）、BAL 顯示 `L`／`R`、該頻段不畫、NOTCH `---`
+- MIN (3") 用「幀數」而不是時間計 3 秒（`deque(maxlen=60)`），跟 peak hold 一樣假設穩定 20 FPS；好處是檢查腳本可以不靠時鐘、結果固定
+- 數字字串只用現有字元集（`0123456789-. LRA`）：CORR 正值不加 `+`、BAL 用 `L 3`／`R 3`／`0` 而不是 `+3`，不動 `_GLYPH_CHARS`（DSEG7 也不一定有 `+`）。新的三組字級（CORR／NOTCH／BAL）加進 `warm_glyph_cache` 開機預熱，執行中不現場畫字
+- goniometer：每幀畫最新一個 block 2400 點（20 FPS × 2400 = 48000，每個取樣點剛好都畫到）；殘影每幀 ×0.78；自動縮放「變大立刻縮、變小約 1 秒放大一倍」，最多放大到 −40 dBFS 填滿，避免把底噪放大成一團
+- **輔助線要畫在殘影層、訊號線之前**：第一版畫在最上層，結果反相（橫線）和單聲道（斜線）的訊號剛好跟輔助線重疊被蓋掉，畫面一片空。改完四種情況都看得到
+- 舊畫面驗證：Loudness／Spectrum／Histogram 兩種模式改版前後各渲染一張，md5 完全相同
+
+**檢查腳本** `tools/check_phase.py`：把 `test_audio/phase_test.wav` 8 段逐段餵進 `compute_phase()`（一個 block 一幀），在第 7 秒檢查 CORR／NOTCH／BAL 範圍，不符就 assert 失敗；給輸出目錄時每段兩頁各存一張 PNG。結果：
+
+| 段 | CORR | NOTCH | BAL |
+|---|---|---|---|
+| 1 同相 | +1.00 | +3.0 | 0 |
+| 2 極性接反 | −1.00 | −30 | 0 |
+| 3／4 只有左／右 | 0.00 | --- | L／R |
+| 5 不相關 | −0.03 | −0.6 | 0 |
+| 6 立體聲 | +0.78 | +2.4 | 0 |
+| 7 梳狀濾波 | +0.15 | −16.2（500 Hz） | 0 |
+| 8 正常擺位 | +0.06 | −3.1（315 Hz） | L 10 |
+
+**筆電耗時**（1280×720，含 compute）：Loudness 0.73／Spectrum 1.92／PHASE GONIO 3.37／BAND 1.57 ms。GONIO 是 Spectrum 的 1.75 倍，跟今天 Pi 實測的比例一致（17.7 ÷ 9.2），推估 Pi 上 16～18 ms，預算 50 ms。實際數字字串每幀都在變（LRU 沒命中要現拼，每串約 1～2 ms），上 Pi 後要看 CPU 與溢位。
+
+**待辦**：部署到 Pi（連同還沒上機的選擇錄音介面版與 `run.sh --restart`）→ PHASE 畫面監看 30～60 分鐘 CPU／溢位 → PM5D Mic A／B 現場實測 → 補 README 的 PHASE 預覽圖。
+
+## 2026-11-25 10:16：熱點上機完成＋PHASE 繪圖 Pi 實測
+
+**熱點**：`setup_hotspot.sh` 由使用者自己 sudo 執行完成。驗證：`meter-hotspot` 在 wlan0、autoconnect yes／priority 100、10.42.0.1/24、WPA-PSK、`ipv4.method shared`；eth0 維持 192.168.10.1，SSH 不受影響；Android 手機連上拿到 10.42.0.106。check 時看到：國家代碼本來就是 TW、dnsmasq-base 已裝、近 7 天 0 次電壓不足。Pi 上還存著兩組舊 Wi-Fi（`Azure_Studio_5G`、`水獺休息站`，autoconnect yes），熱點 priority 較高；若哪天開機時剛好在那兩組附近，要留意 wlan0 會不會被搶走。順手校時：Pi 快了約 2.5 分鐘（距上次校正約 1 天，比平常的 0.5 分／天多，原因不明）。
+
+**PHASE 繪圖 Pi 實測**（`bench_phase.py`，響度計同時在跑、`nice -n 5`，期間 log 無溢位）：
+
+| 項目 | Pi 實測 | 筆電推估 |
+|---|---|---|
+| Loudness（校準） | 8.06 ms | 8.1 ms |
+| Spectrum（含 FFT） | 9.2 ms | 約 21 ms |
+| PHASE 2400 點 | 17.7 ms | 約 22 ms |
+| PHASE 1200 點 | 15.4 ms | 約 18 ms |
+| PHASE 600 點 | 14.2 ms | — |
+| PHASE 反鋸齒 2400 點 | 43.5 ms ❌ | 約 75 ms |
+| goniometer 本體（殘影＋連線＋blit）1200 點 | 12.3 ms | — |
+
+- 筆電推估的「倍率約 10.5」是錯的：Pi 上這組 bench 的倍率約 1.0（筆電那次量的 Loudness 基準可能受別的負載影響），**以後只信 Pi 實測**
+- 點數從 600→2400 只多 3.5 ms，固定成本大頭是殘影（`BLEND_RGB_MULT` 整塊 fill）與 blit，不是連線。要省就從殘影下手（例如縮小 goniometer 區塊或降殘影更新頻率），點數可以放寬到 2400
+- 單次 `draw.lines` 持有 GIL 只有幾 ms，離過去造成溢位的約 33 ms 很遠，原本「要切段畫」的顧慮可以放下；反鋸齒仍不要用
+- 結論：PHASE 每幀約為 Spectrum 的 1.7 倍，20 FPS 預算 50 ms 綽綽有餘
+
+## 2026-11-24：手機切換畫面——Wi-Fi 熱點（2026-11-25 已上機，見上）
 
 - 動機：搬離 PM5D 後沒有 GPIO 按鍵可切畫面。選項比較後使用者選「Pi 開 Wi-Fi 熱點＋手機網頁按鈕」（藍牙要手機假裝成 HID 鍵盤，iPhone 不行、Android 要裝 App，且目前按 ESC 會關掉響度計）。最便宜的替代是 3 顆常開按鈕直接接 Pin 9/11/13/15（不用改程式，可與 PM5D 並聯）。
 - 決定：SSID `MeterOnPi`、2.4 GHz（`band bg`）、使用者手機 Android、公司允許開熱點。連線名稱 `meter-hotspot`，開機自動啟用（autoconnect priority 100，官方教學的做法；hotspot 指令預設不會 autoconnect）。
