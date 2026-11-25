@@ -140,7 +140,7 @@ LM_AUDIO_DEVICE=UMC
 
 ## 操作（用混音台上的按鍵）
 
-在 PM5D 面板的 **USER DEFINED KEYS（Bank A）** 按下對應按鍵即可操作：
+在 PM5D 面板的 **USER DEFINED KEYS（Bank A）** 按下對應按鍵即可操作（**SUB1 only**：GPI 只接在 SUB1 的 PM5D，其他地方請用下面的手機遙控）：
 
 | PM5D 按鍵 | 在 Loudness 畫面 | 在 Spectrum 畫面 | 在 Histogram 畫面 | 在 PHASE 畫面 |
 |-----------|-----------------|-----------------|-------------------|---------------|
@@ -308,7 +308,7 @@ Pi 只負責「看」，不輸出任何聲音——找到問題頻段後，實�
 
 畫面比較的是**左聲道和右聲道，兩支麥克風各佔一邊**。如果接的是節目 L/R、兩支麥克風都在中間，左右永遠一模一樣，correlation 一直是 +1，看不出麥克風之間的問題（這時只能拿來監看節目有沒有反相）。
 
-PM5D 的做法（不用設 VARI、不用配對）：MIX 18 的 PAN 打 LEFT、MIX 19 的 PAN 打 RIGHT；第一組麥克風送 MIX 18、第二組麥克風送 MIX 19，送出點 POST（跟著推桿走，量到的接近節目實際混出來的狀況）；MONITOR 的 DEFINE 開兩個 BUS，選 MIX 18＋MIX 19。**上線前先驗證**：只開第一組麥克風，Loudness 畫面應該只有 L 在跳。
+PM5D 的做法（不用設 VARI、不用配對）：MIX 18 的 PAN 打 LEFT、MIX 19 的 PAN 打 RIGHT；第一支麥克風送 MIX 18、第二支麥克風送 MIX 19（送出點：要看節目實際混出來的樣子用 POST；推桿還沒推上，例如彩排、上線前檢查，用 PRE）；MONITOR 的 DEFINE 開兩個 BUS，選 MIX 18＋MIX 19。**上線前先驗證**：只開第一支麥克風，Loudness 畫面應該只有 L 在跳。看完記得切回：DEFINE 改回 MIX 20，或關掉 DEFINE、改開 STEREO A——響度計量的是 MONITOR 選的訊號。
 
 ### 兩頁（KEY 10 / KEY 11 切換）
 

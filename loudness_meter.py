@@ -1035,9 +1035,13 @@ def _draw_goniometer(surface, surf_cache, font_axis, x0, y0, size):
 
 
 def _draw_band_corr(surface, surf_cache, font_axis, band, notch_i, px, pw, top, bottom):
-    """分頻 correlation：0 為中線，往上綠、往下紅；凹口最深的頻段加黃框。X 軸同 Spectrum。"""
+    """分頻 correlation：0 為中線，往上綠、往下紅；凹口最深的頻段加黃框。X 軸同 Spectrum。
+    X 軸文字另留一列在圖下方（不像 Spectrum 壓在圖底）：這張圖的 Y 軸到 −1 為止都可能有長條、−1 刻度也在最底下，
+    壓在一起會跟頻率文字、黃框打架（2026-11-26 使用者看介紹短片指出）。"""
     MARGIN = 4
     n = len(band)
+    x_axis_y = bottom                                    # 頻率文字的底
+    bottom = bottom - font_axis.get_height() - 2         # 圖區縮到文字列上方
     zone_h = bottom - top
     area_w = pw - MARGIN * 2
     bar_w  = max(2, (area_w - MARGIN * (n - 1)) // n)
@@ -1064,7 +1068,7 @@ def _draw_band_corr(surface, surf_cache, font_axis, band, notch_i, px, pw, top, 
         y = max(top, min(bottom - lab.get_height(), mid - int(v * (zone_h // 2 - 2)) - lab.get_height() // 2))
         surface.blit(lab, (px + MARGIN + 2, y))
         surface.blit(lab, (px + pw - MARGIN - lab.get_width() - 2, y))
-    _draw_x_labels(surface, surf_cache, font_axis, x_lab, px, pw, bottom, MARGIN)
+    _draw_x_labels(surface, surf_cache, font_axis, x_lab, px, pw, x_axis_y, MARGIN)
 
 
 def _draw_corr_bar(surface, surf_cache, font_axis, corr, px, pw, y, h):
