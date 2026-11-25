@@ -323,7 +323,7 @@ PM5D 的做法（不用設 VARI、不用配對）：MIX 18 的 PAN 打 LEFT、MI
 
 ![PHASE BAND 頁](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/phase_band.png)
 
-（範例是測試訊號 `test_audio/phase_test.wav` 的「正常擺位」段：兩支麥克風收同一個聲音、音量差 10 dB，`tools/check_phase.py` 產生）
+（範例是 2026-11-25 兩人座談的實拍：右聲道那支麥克風的人在講，左聲道那支收到漏音，所以 BAL 偏 r、斜線往 R 那側傾。說話時 MIN (3") 出現紅色負數是正常的，3 秒內總會有幾個瞬間對不上）
 
 ### 怎麼看 GONIOMETER
 

@@ -35,6 +35,9 @@
 - 同時把 PHASE 的 PM5D 接法改成使用者現場的做法：MIX 18 PAN RIGHT、MIX 19 PAN LEFT，第一組麥克風→MIX 18、第二組→MIX 19，MONITOR DEFINE 開兩個 BUS 選 18＋19；不設 VARI、不配對。驗證改成「只開第一組，應該只有 R 在跳」。原本寫的「送出點 PRE」也隨使用者版本拿掉
 - 00:48 使用者更正：MIX 18 是 LEFT、MIX 19 是 RIGHT（第一組→L），送出點用 POST（接近節目實際混音）。驗證改回「只開第一組，應該只有 L 在跳」
 - 表格在手機上本來就能左右滑（`.tw` overflow-x），但手機捲軸平常隱藏、看不出來 → 加 CSS 捲動陰影：右緣有亮影代表還有內容，滑到底亮影被蓋掉。純 CSS（background-attachment local／scroll），不用 JS
+- 00:52 遙控頁每個畫面下方放範例圖（使用者要給第一次用的人對照）。跟說明頁共用 Pi 的 `assets/`，不另存一份；PHASE 依子頁換 `phase_gonio.png`／`phase_band.png`，README 畫面四也補上這兩張
+- 範例圖只在換畫面時才改 `src`，不然每 1.5 秒輪詢都會讓 GIF 從頭播。圖載入失敗（assets 沒部署）就連說明文字一起藏起來
+- 01:01 PHASE 範例圖原本用 `check_phase.py` 測試訊號，使用者看座談實拍候選後交給我挑 → GONIO＝13:52:40（CORR 0.59，斜線乾淨）、BAND＝13:44:04（CORR 0.69、NOTCH −1）。實拍比測試訊號接近現場樣子；代價是 MIN 一定是紅的（說話時 3 秒內總有低點），README 圖說註明是正常現象。只有響度計畫面、無電視台素材，可進公開 repo
 
 ## 2026-11-25 16:58：手機遙控 QR 卡 `tools/make_qr_card.py`
 
