@@ -408,7 +408,7 @@ def render_outlined(font, text, color, outline_color=(0, 0, 0), offset=2):
 # 數十毫秒、持有 GIL，音訊 callback 被擋住就 input overflow。實測 5 天 21 小時 7 次溢位，全部落在快取剛長的
 # 10 分鐘區間（快取沒長的 799 個區間 0 次），快取也一路長到 688 張 / 94 MB。
 # 改成每個字元（各字級各色）只畫一次、開機預熱（warm_glyph_cache），顯示時逐字拼：張數固定、執行中不再現場畫。
-_GLYPH_CHARS   = "0123456789-. LRA"           # LUFS、L/R、LRA 小數、頻率（含 ALL）、變化量用到的全部字元
+_GLYPH_CHARS   = "0123456789-. LRA!"          # LUFS、L/R、LRA 小數、頻率（含 ALL）、變化量用到的全部字元；! 是 DSEG7 的全熄格（同 - 寬）
 _NUM_PALETTE   = ((255, 255, 255), (220, 50, 50), (220, 200, 50), (50, 200, 80), (50, 130, 220))  # 白 ＋ lufs_to_color 四色
 _WHITE_ONLY    = ((255, 255, 255),)
 _DELTA_PALETTE = ((220, 50, 50), (110, 200, 110), (140, 140, 140))
@@ -673,13 +673,16 @@ def _update_spectrum_peaks(band_levels):
 # 起因：錄影現場兩位主持人坐太近，兩支麥一起推上去聲音發悶。L = A 麥、R = B 麥（PM5D 用 MIX PAN 一左一右送），
 # 接節目 L/R 時則是監看節目有沒有反相。只在 display_mode == "phase" 時由主迴圈每幀呼叫，跟 Spectrum 一樣不開執行緒。
 _PHASE_SILENT_DB  = -60.0        # 低於這個視為沒訊號（整體用 RMS dBFS、分頻用 Spectrum 同一套 dBFS 校準）
-_PHASE_MIN_FRAMES = int(3.0 * FPS)                      # MIN (3")：假設穩定 FPS，同 peak hold 的做法
+_PHASE_NUM_SEC    = 0.25         # 左欄數字每 0.25 秒換一次（每秒 4 次）；20 次／秒時兩位小數末位每秒變 13～15 次，看不清
+                                 # 指針條、GONIOMETER、分頻長條照 20 FPS（2026-11-26 使用者選「保留兩位小數、降數字更新」）
+_PHASE_MIN_SEC    = 3.0          # MIN (3")：按實際時間算（不是幀數，掉幀也不會變長）
 _PHASE_BAND_ALPHA = 1 - math.exp(-1 / (0.5 * FPS))      # 分頻數值平滑，時間常數 0.5 秒（低頻段 bin 少，不平滑會亂跳）
 _NOTCH_FLOOR_DB   = -30.0
 _NOTCH_BOX_DB     = -3.0         # NOTCH 低於這個才在 BAND 頁框出頻段（使用者 2026-11-25 指定）
 _NOTCH_BANDS      = [i for i, (fc, _, _) in enumerate(OCTAVE_BANDS) if 100 <= fc <= 8000]   # 人聲範圍
 
-_phase_min_q  = collections.deque(maxlen=_PHASE_MIN_FRAMES)
+_phase_num    = {"t": -1.0, "v": None}                  # 左欄目前顯示的數字；t＝下次該換的時間
+_phase_min_q  = collections.deque()                     # (時間, corr)；超過 3 秒的從左邊丟掉
 _phase_band_s = np.zeros((3, len(OCTAVE_BANDS)))        # 平滑後的各頻段 [ΣL², ΣR², Re ΣLR*]
 
 
@@ -711,9 +714,14 @@ def compute_phase(bands=True):
     elif on_l or on_r:
         out["corr"] = 0.0      # 只有一邊有訊號：不相關，不拿另一邊的底噪去算
         out["bal"]  = "L" if on_l else "R"
+    now = time.monotonic()
     if out["corr"] is not None:
-        _phase_min_q.append(out["corr"])
-        out["min3"] = min(_phase_min_q)
+        _phase_min_q.append((now, out["corr"]))
+    # 停頓、切走別的畫面時也照時間丟舊值：重新開口或切回來不會先閃出 3 秒前的最低點
+    while _phase_min_q and _phase_min_q[0][0] < now - _PHASE_MIN_SEC:
+        _phase_min_q.popleft()
+    if out["corr"] is not None:
+        out["min3"] = min(c for _, c in _phase_min_q)
 
     s = list(buf_s_chunks)[-(SPECTRUM_FFT_SIZE // BLOCK_SIZE + 1):]   # 只接需要的 4 個 block，不接整整 3 秒
     if not bands or len(s) * BLOCK_SIZE < SPECTRUM_FFT_SIZE:
@@ -960,11 +968,15 @@ _gon = {"surf": None, "gain": None}   # goniometer 殘影層（跨幀保留）�
 
 
 def _fmt_corr(c):
-    return "---" if c is None else f"{c:.2f}".replace("-0.00", "0.00")
+    # 正數前面補 "!"（DSEG7 的全熄格，跟 "-" 一樣寬）：正負切換時數字不會左右位移半格
+    if c is None:
+        return "---"
+    s = f"{c:.2f}".replace("-0.00", "0.00")
+    return s if s.startswith("-") else "!" + s
 
 
 def _corr_color(c):
-    return (255, 255, 255) if c is None else (_GREEN if c >= 0 else _RED)
+    return (255, 255, 255) if c is None else (_GREEN if round(c, 2) >= 0 else _RED)   # 跟著顯示值：−0.004 顯示 0.00 就是綠
 
 
 def _notch_color(n):
@@ -1078,17 +1090,26 @@ def draw_phase_screen(surface, fonts, surf_cache, W, H, ph, view):
     font_title, font_axis = fonts[0], fonts[1]
     left_w  = W // 5
     third_h = H // 3
+    now = time.monotonic()
+    due = _phase_num["t"]
+    if _phase_num["v"] is None or now >= due or due - now > _PHASE_NUM_SEC:
+        # 排在固定 0.25 秒格線上（不是「現在＋0.25」），幀時間有誤差也平均剛好每秒 4 次；
+        # 落後超過一格（剛切回 PHASE）或時鐘倒退，就從現在重新起算
+        on_time = _phase_num["v"] is not None and 0 <= now - due < _PHASE_NUM_SEC
+        _phase_num["t"] = (due if on_time else now) + _PHASE_NUM_SEC
+        _phase_num["v"] = {k: ph[k] for k in ("corr", "min3", "notch", "bal")}
+    num = _phase_num["v"]   # 左欄用這份（每秒換 4 次）；下面的圖和指針條用 ph（每幀）
     draw_number_only_panel(surface, fonts, surf_cache, "CORR", None, 0, left_w, 0, third_h,
-                           val_str=_fmt_corr(ph["corr"]), num_color=_corr_color(ph["corr"]), ref_strs=_CORR_REFS)
+                           val_str=_fmt_corr(num["corr"]), num_color=_corr_color(num["corr"]), ref_strs=_CORR_REFS)
     if view == "gonio":
         draw_number_only_panel(surface, fonts, surf_cache, 'MIN (3")', None, 0, left_w, third_h, third_h,
-                               val_str=_fmt_corr(ph["min3"]), num_color=_corr_color(ph["min3"]), ref_strs=_CORR_REFS)
+                               val_str=_fmt_corr(num["min3"]), num_color=_corr_color(num["min3"]), ref_strs=_CORR_REFS)
     else:
-        n = ph["notch"]
+        n = num["notch"]
         draw_number_only_panel(surface, fonts, surf_cache, "NOTCH dB", None, 0, left_w, third_h, third_h,
                                val_str="---" if n is None else str(round(n)), num_color=_notch_color(n), ref_strs=_NOTCH_REFS)
     draw_number_only_panel(surface, fonts, surf_cache, "BAL dB", None, 0, left_w, 2 * third_h, H - 2 * third_h,
-                           val_str=ph["bal"] or "---", num_color=(255, 255, 255), ref_strs=_BAL_REFS)
+                           val_str=num["bal"] or "---", num_color=(255, 255, 255), ref_strs=_BAL_REFS)
     for i in (1, 2):
         pygame.draw.line(surface, (55, 55, 55), (0, i * third_h), (left_w, i * third_h), 1)
     pygame.draw.line(surface, (55, 55, 55), (left_w, 0), (left_w, H), 1)

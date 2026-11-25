@@ -40,13 +40,21 @@ if out_dir:
     screen = pygame.display.set_mode((W, H)); fonts = lm.make_fonts(W); cache = {}
 
 SEG, STEP = 9 * 48000, lm.BLOCK_SIZE          # 每段 8 秒＋1 秒靜音
+T = [0.0]                                       # 假時鐘：MIN (3") 按實際時間算，這裡一個 block 走 50 ms
+lm.time.monotonic = lambda: T[0]                # ponytail: 直接換掉 time.monotonic，本腳本只跑 compute_phase／畫圖
+
+
+def feed(blk):
+    T[0] += STEP / 48000
+    lm.buf_m_chunks.append(blk); lm.buf_s_chunks.append(blk)
+    return lm.compute_phase()
+
+
 fail = 0
 for k, (name, c_rng, n_rng, bal) in enumerate(EXPECT):
     seg = x[k * SEG:k * SEG + 8 * 48000]
     for i in range(0, len(seg) - STEP + 1, STEP):   # 一個 block 一幀（20 FPS）
-        blk = seg[i:i + STEP]
-        lm.buf_m_chunks.append(blk); lm.buf_s_chunks.append(blk)
-        ph = lm.compute_phase()
+        ph = feed(seg[i:i + STEP])
         if out_dir and 5 * 48000 <= i < 6 * 48000:  # 出圖前逐幀畫 1 秒，殘影層才會把上一段淡掉（正式程式本來就每幀畫）
             lm.draw_phase_screen(screen, fonts, cache, W, H, ph, "gonio")
         if out_dir and i == 6 * 48000:              # 第 6 秒：殘影與平滑都穩定了
@@ -66,7 +74,40 @@ for k, (name, c_rng, n_rng, bal) in enumerate(EXPECT):
           f"notch {'---' if n is None else f'{n:5.1f}'}"
           f"@{'-' if ph['notch_i'] is None else lm.OCTAVE_BANDS[ph['notch_i']][0]}  bal {ph['bal']:5}| {band}")
     for _ in range(20):                              # 段間靜音 1 秒
-        z = np.zeros((STEP, 2), np.float32); lm.buf_m_chunks.append(z); lm.buf_s_chunks.append(z)
-        lm.compute_phase()
+        feed(np.zeros((STEP, 2), np.float32))
 assert fail == 0, f"{fail} 段不符預期"
+
+# MIN (3") 只看最近 3 秒：極性接反（−1）之後停 4 秒再來同相，MIN 不能還留著 −1
+for i in range(0, 2 * 48000, STEP):
+    feed(x[SEG + i:SEG + i + STEP])                 # 第 2 段 極性接反
+assert lm.compute_phase()["min3"] < -0.9
+for _ in range(80):                                 # 靜音 4 秒
+    feed(np.zeros((STEP, 2), np.float32))
+for i in range(0, 48000, STEP):
+    ph = feed(x[i:i + STEP])                        # 第 1 段 同相
+    assert ph["min3"] is None or ph["min3"] > 0.9, f"停頓後 MIN 還留著舊值 {ph['min3']}"
+assert ph["min3"] > 0.9
+# 掉幀（一幀 100 ms）時 MIN 仍是 3 秒，不是 60 幀＝6 秒
+lm._phase_min_q.clear()
+for i in range(0, 4 * 48000, 2 * STEP):
+    T[0] += STEP / 48000; feed(x[SEG + i:SEG + i + STEP])
+assert 28 <= len(lm._phase_min_q) <= 31, len(lm._phase_min_q)
+print("MIN (3\") 時間視窗 OK")
+
+# 左欄數字每 0.25 秒才換（每秒 4 次），不是每幀
+lm._phase_num.update(t=-1.0, v=None)
+pygame.init(); surf = pygame.Surface((1280, 720)); fnt = lm.make_fonts(1280); c2 = {}
+shown = []
+for i in range(0, 2 * 48000, STEP):                 # 第 8 段 正常擺位 2 秒＝40 幀
+    lm.draw_phase_screen(surf, fnt, c2, 1280, 720, feed(x[7 * SEG + i:7 * SEG + i + STEP]), "gonio")
+    shown.append(lm._phase_num["t"])
+assert len(set(shown)) == 8, len(set(shown))       # 2 秒 × 4 次
+print("左欄數字更新頻率 OK")
+
+# 正負切換時數字不位移：正數補 "!"（DSEG7 全熄格，跟 "-" 同寬），畫出來寬度一樣
+assert lm._fmt_corr(0.11) == "!0.11" and lm._fmt_corr(-0.11) == "-0.11" and lm._fmt_corr(-0.004) == "!0.00"
+assert lm._corr_color(-0.004) == lm._GREEN and lm._corr_color(-0.006) == lm._RED
+fv = fnt[2]
+assert fv.size("!0.11") == fv.size("-0.11"), (fv.size("!0.11"), fv.size("-0.11"))
+print("正負號佔位 OK")
 print("全部符合預期")
