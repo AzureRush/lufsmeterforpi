@@ -154,15 +154,23 @@ LM_AUDIO_DEVICE=UMC
 
 ### 用手機操作（沒有 PM5D 時）
 
-Pi 開機會自動開一個 Wi-Fi 熱點（設定方式見 `tools/setup_hotspot.sh`）：
+Pi 開機會自動開一個 Wi-Fi 熱點：
 
 1. 手機連 Wi-Fi **`MeterOnPi`**（密碼問管理者）。Android 若跳出「此網路沒有網際網路」，選**保持連線**
 2. 瀏覽器開 **http://10.42.0.1:8080**
-3. 上面四顆按鈕**直接跳到**指定畫面；下面兩顆等同 KEY 10 / KEY 11，文字會跟著目前畫面變（Spectrum「往低頻／往高頻」、Histogram「切換範圍」、PHASE「切到 BAND／GONIO」，Loudness 畫面時變灰）
+3. 最下面四顆（LOUD／SPEC／HIST／PHASE）**直接跳到**指定畫面；上面一排「子頁」跟著目前畫面變：Spectrum 是「◀ 低頻／高頻 ▶」（等同 KEY 10／11），Histogram、PHASE 是二選一的分段按鈕，直接點想看的那一邊；Loudness 沒有子頁
+4. 右上角「？說明」打開這份說明（只有「操作」跟「畫面一～四」，內容就是 Pi 上這份 README，跟著部署一起更新）
 
-手機每 1.5 秒同步一次，PM5D 那邊按了 KEY 9，手機上的狀態也會跟著變。網頁沒有密碼，熱點密碼就是門禁。要換 port 或停用，在 `~/.config/labwc/environment` 設 `LM_WEB_PORT=<port>`（`0` 為停用）。
+手機每 1.5 秒同步一次，PM5D 那邊按了 KEY 9，手機上的狀態也會跟著變；左上角綠點變紅＝跟 Pi 斷線。網頁沒有密碼，熱點密碼就是門禁。
+
+<!-- help:skip 以下到 /help:skip 是管理者用的，不放進手機說明頁 -->
+熱點設定方式見 `tools/setup_hotspot.sh`。要換 port 或停用，在 `~/.config/labwc/environment` 設 `LM_WEB_PORT=<port>`（`0` 為停用）。
+
+**QR 卡**：在筆電執行 `py -3.14 tools/make_qr_card.py`，輸入熱點密碼後會產生 `qr_card.png`，上面有兩個 QR code：① 掃描直接連上熱點（Android 10+、iOS 11+ 相機支援）② 掃描打開遙控網頁。尺寸是貼 Pi 盒子用的 80×50 mm（PNG 已標 300 dpi），**列印時選「實際大小／100%」**，不要選「符合頁面」。⚠ 圖裡含熱點密碼（已在 `.gitignore`），拿到卡的人都能切畫面。
 
 > PHASE 實測要留數字紀錄時，在同一個檔案加 `LM_PHASE_LOG=1` 再重啟響度計：停在 PHASE 畫面時，每 2 秒在 `/tmp/lm.log` 寫一行 `[PHASE]`（時間、CORR、MIN、BAL、NOTCH、各頻段 correlation）。預設關閉——`/tmp` 佔用的是記憶體，長時間開著會一直累積。
+
+<!-- /help:skip -->
 
 ### GPI 訊號對應
 
@@ -298,9 +306,9 @@ Pi 只負責「看」，不輸出任何聲音——找到問題頻段後，實�
 
 ### 接線前提：兩支麥克風要分開送進左右聲道
 
-畫面比較的是**左聲道（A 麥）和右聲道（B 麥）**。如果接的是節目 L/R、兩支麥克風都在中間，左右永遠一模一樣，correlation 一直是 +1，看不出麥克風之間的問題（這時只能拿來監看節目有沒有反相）。
+畫面比較的是**左聲道和右聲道，兩支麥克風各佔一邊**。如果接的是節目 L/R、兩支麥克風都在中間，左右永遠一模一樣，correlation 一直是 +1，看不出麥克風之間的問題（這時只能拿來監看節目有沒有反相）。
 
-PM5D 的做法：MIX 23/24 設 VARI 並配成一對；Mic A、Mic B 的 CH 都把 FOLLOW PAN [VARI] 關掉，送 23/24 的 MIX PAN 一個打最左、一個打最右，送出點 PRE；MONITOR 的 DEFINE 勾 23 與 24，[MONO] 關掉。**上線前先驗證**：只開 Mic A，Loudness 畫面應該只有 L 在跳。
+PM5D 的做法（不用設 VARI、不用配對）：MIX 18 的 PAN 打 LEFT、MIX 19 的 PAN 打 RIGHT；第一組麥克風送 MIX 18、第二組麥克風送 MIX 19，送出點 POST（跟著推桿走，量到的接近節目實際混出來的狀況）；MONITOR 的 DEFINE 開兩個 BUS，選 MIX 18＋MIX 19。**上線前先驗證**：只開第一組麥克風，Loudness 畫面應該只有 L 在跳。
 
 ### 兩頁（KEY 10 / KEY 11 切換）
 
@@ -310,6 +318,12 @@ PM5D 的做法：MIX 23/24 設 VARI 並配成一對；Mic A、Mic B 的 CH 都�
 | **BAND** | 會不會悶（梳狀濾波） | CORR／**NOTCH dB**／BAL dB | BAND CORRELATION |
 
 兩頁下方都有一條 correlation 指針條（從中間往右綠、往左紅），遠看也清楚。
+
+![PHASE GONIO 頁](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/phase_gonio.png)
+
+![PHASE BAND 頁](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/phase_band.png)
+
+（範例是測試訊號 `test_audio/phase_test.wav` 的「正常擺位」段：兩支麥克風收同一個聲音、音量差 10 dB，`tools/check_phase.py` 產生）
 
 ### 怎麼看 GONIOMETER
 

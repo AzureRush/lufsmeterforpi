@@ -11,6 +11,10 @@ import os
 import signal
 import gc
 import json
+import html
+import itertools
+import mimetypes
+import re
 import http.server
 from scipy.signal import lfilter
 from gpiozero import Button
@@ -1157,34 +1161,158 @@ def _set_display_mode(name):
 # 只用 stdlib；handler 只改上面那幾個全域變數（跟 GPIO 回呼一樣，賦值是 GIL 原子操作），
 # 不畫圖、不運算，不會卡住音訊 callback。
 # 沒有密碼：熱點的 WPA 密碼就是門禁。⚠ 綁 0.0.0.0，eth0 若接上公司網路，同網段的人也打得到，到時要另加限制。
+_WEB_CSS = """:root{--bg:#000;--panel:#1c1c1c;--line:#373737;--dim:#aaa;--txt:#fff;--ok:#32c850;--bad:#dc3232;--yel:#dcc832;
+--mono:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--txt);font:16px system-ui,sans-serif}
+button{font:700 20px var(--mono);color:var(--txt);background:var(--panel);border:2px solid var(--line);border-radius:12px;
+padding:22px 8px;touch-action:manipulation;transition:transform .08s}button:active{transform:scale(.96)}
+.pill{color:var(--txt);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:6px 14px;background:var(--panel)}
+[hidden]{display:none!important}"""
+
+# 配色取自 Pi 螢幕：黑底、面板 (28,28,28)、框線 (55,55,55)、選中用響度計的綠 (50,200,80)、斷線用紅 (220,50,50)
 _WEB_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Meter 遙控</title><style>
-body{margin:0;padding:16px;background:#111;color:#ddd;font:18px system-ui,sans-serif}
-#st{font-size:22px;text-align:center;margin:8px 0 16px;color:#8cf}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
-button{font:inherit;font-size:22px;padding:28px 8px;border:2px solid #444;border-radius:14px;
-background:#222;color:#eee;touch-action:manipulation}
-button.on{background:#2a6;border-color:#4c8;color:#fff}button:disabled{color:#555;border-color:#2a2a2a}
-</style></head><body><div id="st">連線中…</div>
-<div class="g"><button data-m="loudness">Loudness</button><button data-m="spectrum">Spectrum</button>
-<button data-m="histogram">Histogram</button><button data-m="phase">PHASE</button></div>
-<div class="g"><button id="prev">—</button><button id="next">—</button></div>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Meter 遙控</title><style>""" + _WEB_CSS + """
+body{height:100dvh;display:flex;flex-direction:column;padding:12px 16px calc(16px + env(safe-area-inset-bottom))}
+header{display:flex;align-items:center;gap:8px;color:var(--dim)}header .pill{margin-left:auto}
+#dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.off #dot{background:var(--bad);box-shadow:0 0 8px var(--bad)}.off #conn{color:var(--bad)}
+main{flex:1;display:flex;flex-direction:column;justify-content:center;padding:0 4px}.off main{opacity:.35}
+#mode{font:800 clamp(40px,13vw,64px)/1 var(--mono)}#sub{font:700 22px var(--mono);color:var(--ok);margin-top:10px;min-height:1.3em}
+#ex{width:100%;min-height:0;object-fit:contain;object-position:left;margin-top:16px;border:1px solid var(--line);border-radius:8px}
+.cap{font-size:12px;color:var(--dim);margin-top:6px}#ex[hidden]+.cap{display:none}
+.lbl{font:700 12px var(--mono);color:var(--dim);letter-spacing:.15em;margin:18px 0 8px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button.on{border-color:var(--ok);color:var(--ok);box-shadow:inset 0 0 0 1px var(--ok)}
+.seg{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:4px;background:var(--panel);border:2px solid var(--line);border-radius:12px}
+.seg button{border:0;background:none;padding:16px 4px;font-size:18px;color:var(--dim)}
+.seg button.on{background:var(--ok);color:#000;box-shadow:none}
+.step{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px}
+.step button{font-size:17px}#fq{font:800 22px var(--mono);min-width:5em;text-align:center}
+.none{color:#666;text-align:center;padding:22px 0;border:2px dashed #2a2a2a;border-radius:12px}
+</style></head><body>
+<header><span id="dot"></span><span id="conn">連線中…</span><a class="pill" href="/help">？說明</a></header>
+<main><div id="mode">—</div><div id="sub"></div><img id="ex" alt="" hidden onerror="this.hidden=true"><div class="cap">↑ 範例畫面，對照 Pi 螢幕用</div></main>
+<section><div class="lbl">子頁</div>
+<div id="seg" class="seg" hidden><button></button><button></button></div>
+<div id="step" class="step" hidden><button id="prev">◀ 低頻</button><span id="fq"></span><button id="next">高頻 ▶</button></div>
+<div id="none" class="none" hidden>這個畫面沒有子頁</div>
+<div class="lbl">畫面</div>
+<div class="g"><button data-m="loudness">LOUD</button><button data-m="spectrum">SPEC</button>
+<button data-m="histogram">HIST</button><button data-m="phase">PHASE</button></div></section>
 <script>
-const N={loudness:"Loudness",spectrum:"Spectrum",histogram:"Histogram",phase:"PHASE"};
-const prev=document.getElementById("prev"),next=document.getElementById("next"),st=document.getElementById("st");
-async function call(p,o){try{show(await (await fetch(p,o)).json())}catch(e){st.textContent="連線中斷，重試中…"}}
+const $=id=>document.getElementById(id);
+const BIG={loudness:"LOUDNESS",spectrum:"SPECTRUM",histogram:"HISTOGRAM",phase:"PHASE"};
+// 範例圖放 Pi 的 assets/（跟 README 說明頁共用）；PHASE 兩頁各一張
+const EX={loudness:"loudness_preview.gif",spectrum:"spectrum_preview.gif",histogram:"histogram_preview.gif",phase:{gonio:"phase_gonio.png",band:"phase_band.png"}};
+const SUB={phase:[["gonio","GONIO"],["band","BAND"]],histogram:[["hour","這一小時"],["slide","最近 {n} 分"]]};
+async function call(p,o){try{show(await (await fetch(p,o)).json())}catch(e){document.body.classList.add("off");$("conn").textContent="斷線，重試中…"}}
 function show(s){
+ document.body.classList.remove("off");$("conn").textContent="已連線";
  document.querySelectorAll("[data-m]").forEach(b=>b.classList.toggle("on",b.dataset.m==s.mode));
- let a="不作用",b=a,i="";
- if(s.mode=="spectrum"){a="◀ 往低頻";b="往高頻 ▶";i="頻段 "+s.freq}
- else if(s.mode=="histogram"){a=b="切換範圍";i=s.hist_mode=="hour"?"這一小時":"最近 "+s.slide_min+" 分鐘"}
- else if(s.mode=="phase"){a=b=s.phase_view=="gonio"?"切到 BAND":"切到 GONIO";i=s.phase_view.toUpperCase()}
- prev.textContent=a;next.textContent=b;prev.disabled=next.disabled=s.mode=="loudness";
- st.textContent=N[s.mode]+(i?"｜"+i:"")}
+ const opts=SUB[s.mode],cur={phase:s.phase_view,histogram:s.hist_mode}[s.mode];
+ $("mode").textContent=BIG[s.mode];
+ $("seg").hidden=!opts;$("step").hidden=s.mode!="spectrum";$("none").hidden=s.mode!="loudness";
+ let sub=s.mode=="spectrum"?"頻段 "+s.freq:"";
+ if(opts)[...$("seg").children].forEach((b,i)=>{b.textContent=opts[i][1].replace("{n}",s.slide_min);
+  b.classList.toggle("on",opts[i][0]==cur);if(opts[i][0]==cur)sub=b.textContent});
+ $("fq").textContent=s.freq;$("sub").textContent=sub;
+ const e=EX[s.mode],src="/assets/"+(typeof e=="object"?e[s.phase_view]:e);   // 只在換圖時設 src，不然 GIF 每 1.5 秒重播
+ if($("ex").dataset.src!=src){$("ex").dataset.src=src;$("ex").src=src;$("ex").hidden=false}}
+// 分段按鈕只有兩邊：點已選中的不送；點另一邊＝按一次 KEY 10（跟實體鍵同一套邏輯）
+$("seg").onclick=e=>{const b=e.target.closest("button");if(b&&!b.classList.contains("on"))call("/next",{method:"POST"})};
 document.querySelectorAll("[data-m]").forEach(b=>b.onclick=()=>call("/mode/"+b.dataset.m,{method:"POST"}));
-prev.onclick=()=>call("/prev",{method:"POST"});next.onclick=()=>call("/next",{method:"POST"});
+$("prev").onclick=()=>call("/prev",{method:"POST"});$("next").onclick=()=>call("/next",{method:"POST"});
 call("/state");setInterval(()=>call("/state"),1500);  // 輪詢：實體 KEY 9 按下時手機也會同步
 </script></body></html>"""
+
+_HELP_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Meter 說明</title><style>""" + _WEB_CSS + """
+body{padding:0 16px 32px;max-width:760px;margin:auto;line-height:1.7}
+nav{position:sticky;top:0;background:var(--bg);padding:12px 0;border-bottom:1px solid var(--line)}
+h2{font:800 22px var(--mono);margin:32px 0 8px;padding-bottom:6px;border-bottom:2px solid var(--line)}h3{color:var(--ok);margin:24px 0 6px}
+img{max-width:100%;border:1px solid var(--line);border-radius:8px}hr{border:0;border-top:1px solid var(--line)}
+.tw{overflow-x:auto;background:linear-gradient(to left,var(--bg) 40%,#0000) right/40px 100% no-repeat local,
+radial-gradient(farthest-side at 100% 50%,#ffffff40,#0000) right/16px 100% no-repeat scroll}table{border-collapse:collapse;font-size:14px;min-width:100%}
+th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top}th{background:var(--panel);white-space:nowrap}
+code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px}
+blockquote{margin:12px 0;padding:8px 12px;border-left:3px solid var(--yel);background:#141414}
+sup a{color:var(--ok);text-decoration:none}.fn{font-size:14px;color:#ccc}
+</style></head><body><nav><a class="pill" href="/">← 回遙控</a></nav>
+@BODY@</body></html>"""
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_HELP_KEEP = ("操作", "畫面")               # 說明頁只放「怎麼看」：README 的 ## 操作、## 畫面一～四
+_HELP_SKIP = ("GPI 訊號對應", "遠端觸發")    # 接線／開發用的 ### 小節不放；段落層級用 README 裡的 <!-- help:skip --> 夾起來
+
+
+def _md_inline(s, fn):
+    def img(m):   # README 的圖連到 GitHub，熱點沒網路 → 換成 Pi 本機 assets/ 的同名檔，沒有就不放
+        name = os.path.basename(m.group(2))
+        return f'<img src="/assets/{name}" alt="{m.group(1)}">' if os.path.isfile(os.path.join(_HERE, "assets", name)) else ""
+    s = html.escape(s, quote=False)
+    s = re.sub(r"!\[([^\]]*)\]\(([^)]*)\)", img, s)
+    s = re.sub(r"\[\^([\w-]+)\]", lambda m: f'<sup><a href="#fn-{m.group(1)}">{fn.get(m.group(1), "?")}</a></sup>', s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)   # 外部連結只留文字
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+
+
+def _md_kind(line):
+    if not line.strip():
+        return ""
+    for k, pat in (("h", r"#{2,3} "), ("hr", r"---\s*$"), ("table", r"\|"), ("quote", ">"), ("ul", r"[-*] "), ("ol", r"\d+\. ")):
+        if re.match(pat, line):
+            return k
+    return "p"
+
+
+def _readme_help():
+    """README → 說明頁 HTML，每次請求現讀（README 改了重傳就生效，不用重啟）。
+    ponytail: 只認 README 實際用到的 Markdown（標題、表格、條列、引用、粗體、code、圖、註腳），不是完整 Markdown；
+    README 若開始用程式碼區塊、巢狀清單等，要在 _md_kind 補。"""
+    try:
+        with open(os.path.join(_HERE, "README.md"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return "<p>說明檔未部署：把 README.md 傳到 Pi 的 ~/loudness_meter/</p>"
+    notes = dict(m.groups() for m in (re.match(r"\[\^([\w-]+)\]:\s*(.*)", l) for l in lines) if m)
+    kept, keep, skip, admin = [], False, False, False
+    for l in lines:
+        if l.startswith(("<!-- help:skip", "<!-- /help:skip")):   # README 裡夾起來的管理者段落（GitHub 上看不到這行註解）
+            admin = l.startswith("<!-- help:skip")
+            continue
+        m = re.match(r"(#{2,3}) (.*)", l)
+        if admin:
+            continue
+        if m and m.group(1) == "##":
+            keep, skip = m.group(2).startswith(_HELP_KEEP), False
+        elif m:
+            skip = m.group(2).startswith(_HELP_SKIP)
+        if keep and not skip and not l.startswith("[^"):
+            kept.append(l)
+    used = list(dict.fromkeys(k for k in re.findall(r"\[\^([\w-]+)\]", "\n".join(kept)) if k in notes))
+    fn = {k: i + 1 for i, k in enumerate(used)}
+    out = []
+    for k, g in itertools.groupby(kept, _md_kind):
+        g = list(g)
+        if k == "h":
+            out += [f"<h{len(l.split()[0])}>{_md_inline(l.split(' ', 1)[1], fn)}</h{len(l.split()[0])}>" for l in g]
+        elif k == "hr":
+            out.append("<hr>")
+        elif k == "table":
+            rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in g if not re.match(r"\|[\s:|-]+$", l)]
+            cell = lambda tag, r: "<tr>" + "".join(f"<{tag}>{_md_inline(c, fn)}</{tag}>" for c in r) + "</tr>"
+            out.append('<div class="tw"><table>' + cell("th", rows[0]) + "".join(cell("td", r) for r in rows[1:]) + "</table></div>")
+        elif k == "quote":
+            out.append("<blockquote>" + _md_inline(" ".join(l.lstrip(">").strip() for l in g), fn) + "</blockquote>")
+        elif k in ("ul", "ol"):
+            out.append(f"<{k}>" + "".join(f"<li>{_md_inline(l.split(' ', 1)[1], fn)}</li>" for l in g) + f"</{k}>")
+        elif k == "p":
+            out.append("<p>" + _md_inline(" ".join(g), fn) + "</p>")
+    if used:
+        out.append('<hr><h3>名詞備註</h3><ol class="fn">'
+                   + "".join(f'<li id="fn-{k}">{_md_inline(notes[k], fn)}</li>' for k in used) + "</ol>")
+    return "\n".join(out)
 
 
 def _web_state():
@@ -1195,7 +1323,7 @@ def _web_state():
 
 class _WebHandler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
-        b = body.encode()
+        b = body if isinstance(body, bytes) else body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
@@ -1208,6 +1336,12 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, _WEB_HTML, "text/html; charset=utf-8")
         elif self.path == "/state":
             self._send(200, json.dumps(_web_state()))
+        elif self.path == "/help":
+            self._send(200, _HELP_HTML.replace("@BODY@", _readme_help()), "text/html; charset=utf-8")
+        elif self.path.startswith("/assets/") and (name := self.path[8:]) == os.path.basename(name) \
+                and os.path.isfile(p := os.path.join(_HERE, "assets", name)):   # 只給 assets/ 底下的檔，擋 ../
+            with open(p, "rb") as f:
+                self._send(200, f.read(), mimetypes.guess_type(name)[0] or "application/octet-stream")
         else:
             self._send(404, "{}")
 

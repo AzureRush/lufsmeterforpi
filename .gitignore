@@ -10,3 +10,6 @@ __pycache__/
 intro_src/
 intro*.mp4
 intro_still_*.png
+
+# 手機遙控 QR 卡（含熱點密碼，不進公開 repo）
+qr_card*.png

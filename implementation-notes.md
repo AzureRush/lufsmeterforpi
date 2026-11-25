@@ -21,6 +21,30 @@
 - 頁面 JS：`node --check` 通過；用假 DOM 跑 `show()`，四種畫面的狀態列與按鈕文字、停用狀態都正確。**沒有開真的瀏覽器看版面**（記憶中「暫停 Claude Browser」），上 Pi 後用手機實際看
 - `check_phase.py` 8 段全過；Loudness／Spectrum／Histogram 兩模式 md5 與改版前相同
 
+## 2026-11-25 23:30：遙控頁改版＋手機說明頁（**未部署**）
+
+- 版面照使用者選的「跟響度計畫面同風格、單手拿」：上方大字顯示目前畫面＋子頁，按鈕全部在下半部。配色直接取 Pi 螢幕的 RGB（黑底、面板 28、框線 55、選中綠 (50,200,80)、斷線紅 (220,50,50)），字用等寬粗體
+- PHASE／Histogram 的子頁改成分段按鈕（二選一）。點已選中那邊不送；點另一邊送 `/next`，等於按一次 KEY 10——伺服器端沒有新 API，手機和實體鍵還是同一套 `_step_freq`
+- 說明頁 `/help`：每次請求現讀 Pi 上的 `README.md`，只取 `## 操作`、`## 畫面…`，扣掉 `### GPI 訊號對應`、`### 遠端觸發`（使用者選「只放怎麼看」）。README 改了重傳就生效，不必重啟，也不必另外維護網頁版
+- 自寫約 50 行 Markdown→HTML（`_readme_help`），只支援 README 實際用到的格式；README 若開始用程式碼區塊、巢狀清單要補 `_md_kind`。不加 markdown 套件：Pi venv 不想多裝東西，且只需要這幾種
+- 截圖：README 的圖連 GitHub，熱點沒網路 → 換成 Pi 本機 `assets/` 同名檔（使用者要求截圖也部署上去），找不到就不放。`/assets/<檔名>` 只給 `assets/` 底下的檔，擋 `../`（`tools/check_web.py` 有測）。三張 GIF 共約 1.6 MB
+- 外部連結只留文字（熱點沒網路，點了也打不開）；註腳改成編號，附在說明頁最下面
+- 部署多了 README.md＋三張 GIF，流程寫進專案 CLAUDE.md Step 5
+- 預覽時抓到一個 bug：子頁文字「最近 N 分」用 `replace("N")` 會把 GONIO 換成 GO3IO，改成 `{n}` 佔位
+- 00:44 使用者看過說明頁後要求拿掉管理者內容（熱點設定、換 port、QR 卡、`LM_PHASE_LOG`）。README（GitHub）仍要保留這些，所以在 README 用 `<!-- help:skip -->`…`<!-- /help:skip -->` 夾起來，GitHub 上看不到註解、說明頁跳過。比再加一份網頁專用說明檔省事，以後要藏哪段就夾哪段
+- 同時把 PHASE 的 PM5D 接法改成使用者現場的做法：MIX 18 PAN RIGHT、MIX 19 PAN LEFT，第一組麥克風→MIX 18、第二組→MIX 19，MONITOR DEFINE 開兩個 BUS 選 18＋19；不設 VARI、不配對。驗證改成「只開第一組，應該只有 R 在跳」。原本寫的「送出點 PRE」也隨使用者版本拿掉
+- 00:48 使用者更正：MIX 18 是 LEFT、MIX 19 是 RIGHT（第一組→L），送出點用 POST（接近節目實際混音）。驗證改回「只開第一組，應該只有 L 在跳」
+- 表格在手機上本來就能左右滑（`.tw` overflow-x），但手機捲軸平常隱藏、看不出來 → 加 CSS 捲動陰影：右緣有亮影代表還有內容，滑到底亮影被蓋掉。純 CSS（background-attachment local／scroll），不用 JS
+
+## 2026-11-25 16:58：手機遙控 QR 卡 `tools/make_qr_card.py`
+
+- 一張卡兩個 QR：① `WIFI:T:WPA;S:MeterOnPi;P:<密碼>;;`（相機掃描直接加入 Wi-Fi）② `http://10.42.0.1:8080`。一個 QR 只能做一件事，沒辦法「連熱點＋開網頁」合一；合一要做 captive portal（Pi 上改 DNS／轉發，要 sudo、各家手機行為不一），不做
+- 密碼用 `getpass` 在筆電上由使用者自己輸入（兩次、≥ 8 字元），不經過 Claude、不寫進任何檔案；但**輸出的 PNG 本身含密碼**，`.gitignore` 加 `qr_card*.png`
+- Wi-Fi QR 特殊字元 `\ ; , : "` 要加反斜線跳脫（已用含這些字元的假密碼驗證）
+- 用 segno（純 Python）＋ Pillow，字型 Windows 的 Noto Sans TC；在 `py -3.14` 跑（py -3.8 沒有 segno）
+- 取捨：拿到卡的人都能連熱點、切畫面（熱點密碼是唯一門禁）
+- 20:34 改成貼 Pi 盒子的小卡：80×50 mm @300 dpi（PNG 寫入 dpi，100% 列印就是實際尺寸）。QR 約 3 cm（Wi-Fi QR 是 version 3、33 格含邊，一格約 1 mm，手機 10～20 cm 內掃得到）；拿掉大標題，字縮到 2.4～3.6 mm（最小約 7 pt，貼紙上的可讀下限）。QR 每格改用整數倍像素，避免縮放後粗細不一
+
 ## 2026-11-25 16:47：`[PHASE]` 紀錄改成環境變數開關（**未部署**）
 
 - `/tmp` 是 tmpfs（吃 RAM），`[PHASE]` 在 PHASE 畫面每 2 秒一行、一天約 6.5 MB、重啟前不會清。實測已做完，改成 `LM_PHASE_LOG=1` 才寫，預設關（寫在 `~/.config/labwc/environment`，跟 `LM_WEB_PORT` 同一處）

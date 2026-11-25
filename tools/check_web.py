@@ -31,7 +31,23 @@ def req(path, post=False):
 
 
 html = req("/")
-assert "Loudness" in html and "/state" in html
+assert "LOUD" in html and "/state" in html and 'href="/help"' in html
+
+h = req("/help")                                                                   # README → 說明頁
+assert "畫面四" in h and "<table>" in h and 'id="fn-lufs"' in h, h[:300]
+assert "GPI 訊號對應" not in h and "技術架構" not in h and "更新記錄" not in h       # 只放「怎麼看」
+assert "QR 卡" not in h and "LM_WEB_PORT" not in h and "LM_PHASE_LOG" not in h and "setup_hotspot" not in h   # help:skip 夾起來的
+assert "MIX 18" in h and "help:skip" not in h and 'src="/assets/phase_band.png"' in h
+assert "phase_gonio.png" in html                                                    # 遙控頁範例圖
+assert 'src="/assets/loudness_preview.gif"' in h and "githubusercontent" not in h
+assert "](" not in h and "**" not in h                                             # 沒有漏轉的 Markdown
+with urllib.request.urlopen(base + "/assets/loudness_preview.gif", timeout=3) as r:
+    assert r.headers["Content-Type"] == "image/gif" and r.read(6) == b"GIF89a"
+for bad in ("/assets/../loudness_meter.py", "/assets/..", "/assets/", "/assets/nope.gif"):
+    try:
+        req(bad); raise AssertionError(bad + " 應回 404")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
 s = json.loads(req("/state"))
 assert s["mode"] == "loudness", s
 
