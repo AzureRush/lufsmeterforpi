@@ -1,7 +1,7 @@
 # 樹莓派多功能響度計
 
 [![GitHub](https://img.shields.io/badge/GitHub-lufsmeterforpi-blue?logo=github&style=flat)](https://github.com/AzureRush/lufsmeterforpi)
-[![HackMD](https://img.shields.io/badge/HackMD-RasberryPi4B_LUFSMeter-0EA5E9?logo=hackmd&logoColor=white)](https://hackmd.io/@penomadd/RasberryPi4B_LUFSMeter?view)
+[![HackMD](https://img.shields.io/badge/HackMD-MeterOnPi-0EA5E9?logo=hackmd&logoColor=white)](https://hackmd.io/@penomadd/MeterOnPi?view)
 
 
 ![響度計Demo](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/loudness_preview.gif)
