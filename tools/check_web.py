@@ -35,7 +35,7 @@ assert "LOUD" in html and "/state" in html and 'href="/help"' in html
 
 h = req("/help")                                                                   # README → 說明頁
 assert "畫面四" in h and "<table>" in h and 'id="fn-lufs"' in h, h[:300]
-assert "GPI 訊號對應" not in h and "技術架構" not in h and "更新記錄" not in h       # 只放「怎麼看」
+assert "GPI 訊號對應" not in h and "技術架構" not in h and "更新紀錄" not in h       # 只放「怎麼看」
 assert "QR 卡" not in h and "LM_WEB_PORT" not in h and "LM_PHASE_LOG" not in h and "setup_hotspot" not in h   # help:skip 夾起來的
 assert "MIX 18" in h and "help:skip" not in h and 'src="/assets/phase_band.png"' in h
 assert "phase_gonio.png" in html                                                    # 遙控頁範例圖
