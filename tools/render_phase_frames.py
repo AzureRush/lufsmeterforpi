@@ -4,6 +4,8 @@ make_intro_video.py 讀這些 PNG 當 PHASE 兩段的畫面。
     python tools/render_phase_frames.py      # 需 numpy、pygame（跟 check_phase.py 同一個環境）；輸出 intro_src/phase/
 
 畫面就是響度計真正畫出來的樣子，介面改了重跑一次即可。intro_src/ 在 .gitignore。
+README 畫面四的 assets/phase_preview.gif 也是從這裡的 gonio 幀做的（5 fps、48 色，約 1.2 MB）：
+    ffmpeg -framerate 20 -i intro_src/phase/gonio_%04d.png -vf "fps=5,split[a][b];[a]palettegen=max_colors=48:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" -loop 0 assets/phase_preview.gif
 """
 import os, sys, types, wave
 os.environ["SDL_VIDEODRIVER"] = "dummy"; os.environ["SDL_AUDIODRIVER"] = "dummy"

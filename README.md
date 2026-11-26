@@ -163,14 +163,6 @@ Pi 開機會自動開一個 Wi-Fi 熱點：
 
 手機每 1.5 秒同步一次，PM5D 那邊按了 KEY 9，手機上的狀態也會跟著變；左上角綠點變紅＝跟 Pi 斷線。網頁沒有密碼，熱點密碼就是門禁。
 
-<!-- help:skip 以下到 /help:skip 是管理者用的，不放進手機說明頁 -->
-熱點設定方式見 `tools/setup_hotspot.sh`。要換 port 或停用，在 `~/.config/labwc/environment` 設 `LM_WEB_PORT=<port>`（`0` 為停用）。
-
-**QR 卡**：在筆電執行 `py -3.14 tools/make_qr_card.py`，輸入熱點密碼後會產生 `qr_card.png`，上面有兩個 QR code：① 掃描直接連上熱點（Android 10+、iOS 11+ 相機支援）② 掃描打開遙控網頁。尺寸是貼 Pi 盒子用的 80×50 mm（PNG 已標 300 dpi），**列印時選「實際大小／100%」**，不要選「符合頁面」。⚠ 圖裡含熱點密碼（已在 `.gitignore`），拿到卡的人都能切畫面。
-
-> PHASE 實測要留數字紀錄時，在同一個檔案加 `LM_PHASE_LOG=1` 再重啟響度計：停在 PHASE 畫面時，每 2 秒在 `/tmp/lm.log` 寫一行 `[PHASE]`（時間、CORR、MIN、BAL、NOTCH、各頻段 correlation）。預設關閉——`/tmp` 佔用的是記憶體，長時間開著會一直累積。
-
-<!-- /help:skip -->
 
 ### GPI 訊號對應
 
@@ -299,6 +291,10 @@ Pi 只負責「看」，不輸出任何聲音——找到問題頻段後，實�
 ---
 
 ## 畫面四：PHASE（極性／相位）
+
+![PHASE 畫面](https://raw.githubusercontent.com/AzureRush/lufsmeterforpi/refs/heads/main/assets/phase_preview.gif)
+
+（動畫是測試訊號：同相 → 極性接反 → 正常擺位，GONIO 頁）
 
 ### 用途
 

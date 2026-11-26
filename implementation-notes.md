@@ -21,6 +21,22 @@
 - 頁面 JS：`node --check` 通過；用假 DOM 跑 `show()`，四種畫面的狀態列與按鈕文字、停用狀態都正確。**沒有開真的瀏覽器看版面**（記憶中「暫停 Claude Browser」），上 Pi 後用手機實際看
 - `check_phase.py` 8 段全過；Loudness／Spectrum／Histogram 兩模式 md5 與改版前相同
 
+## 2026-11-26 14:08：管理者操作備忘（從 README 移過來）
+
+使用者把下面這幾段從 README 拿掉（README 只留給使用的人看），改放這裡。README 裡原本夾住它們的 `<!-- help:skip -->` 也一併拿掉了；`_readme_help()` 仍支援這個標記，以後要藏段落還能用。
+
+- **熱點**：設定腳本 `tools/setup_hotspot.sh`（NetworkManager 連線 `meter-hotspot`、SSID MeterOnPi、Pi 端 10.42.0.1、shared 模式）
+- **手機遙控網頁的 port**：在 Pi 的 `~/.config/labwc/environment` 設 `LM_WEB_PORT=<port>`，`0` 為停用；預設 8080
+- **QR 卡**：筆電執行 `py -3.14 tools/make_qr_card.py`（py -3.8 沒有 segno），輸入熱點密碼兩次（不顯示、不存檔）→ 專案根目錄 `qr_card.png`。① 掃描直接連上熱點（Android 10+、iOS 11+ 相機支援）② 掃描打開遙控網頁。80×50 mm、PNG 已標 300 dpi，**列印選「實際大小／100%」**，不要選「符合頁面」。⚠ 圖裡含熱點密碼（已在 `.gitignore`），拿到卡的人都能切畫面
+- **PHASE 數字紀錄**：同一個 environment 檔加 `LM_PHASE_LOG=1` 再重啟響度計，停在 PHASE 畫面時每 2 秒在 `/tmp/lm.log` 寫一行 `[PHASE]`（時間、CORR、MIN、BAL、NOTCH、各頻段 correlation）。預設關閉——`/tmp` 是 tmpfs 佔記憶體，長時間開著會一直累積
+
+## 2026-11-26 13:48：README 畫面四加 GONIOMETER 動畫
+
+- 使用者要「照前面幾個畫面的寫法」把 goniometer 加進 README：其他三個畫面都在標題下方放一張預覽動畫，PHASE 只有後面兩張靜態實拍 → 補 `assets/phase_preview.gif`，標題下方、`### 用途` 之前
+- 素材用 `render_phase_frames.py` 已產生的 gonio 幀（測試訊號：同相 → 極性接反 → 正常擺位），所以加一行圖說註明是測試訊號；不是現場實拍（Pi 上沒錄過連續畫面）
+- 10 fps 是 2.2 MB（其他預覽 0.4～0.6 MB）→ 降到 5 fps、48 色，1.2 MB，goniometer 動態仍看得出來。ffmpeg 指令寫在 render_phase_frames.py 檔頭
+- 說明頁會自動帶出這張（/help 把 GitHub 圖換成 Pi 本機 assets/），部署清單加 `phase_preview.gif`
+
 ## 2026-11-26 02:32：介紹短片的遙控卡直接放 QR 卡（⚠ 影片含熱點密碼）
 
 - 使用者 QR 卡還沒印出來貼，要求影片直接放 `qr_card.png`。我提醒這支片原本是社群分享用、QR ① 含熱點密碼，給了「公開／內部兩版」「只放 ② 網址 QR」兩個替代方案，**使用者選直接放整張**

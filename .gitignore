@@ -13,3 +13,6 @@ intro_still_*.png
 
 # 手機遙控 QR 卡（含熱點密碼，不進公開 repo）
 qr_card*.png
+
+# 現場實測截圖與 log（座談等，內部資料，不進公開 repo）
+field_tests/
